@@ -1,0 +1,150 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Remove Default VPC'
+Resources:
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'lambda.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      - 'arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess'
+      Policies:
+      - PolicyName: ec2
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'ec2:DeleteSubnet'
+            - 'ec2:DeleteSecurityGroup'
+            - 'ec2:DeleteInternetGateway'
+            - 'ec2:DetachInternetGateway'
+            - 'ec2:DeleteVpc'
+            - 'ec2:DeleteNetworkAcl'
+            - 'ec2:DeleteRouteTable'
+            Resource: '*'
+  VPCPolicyCustomResource: 
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import sys,json,boto3,urllib3
+          http = urllib3.PoolManager()
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+          client_cloudformation = boto3.client('cloudformation')
+          responseData = {}
+
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+              responseUrl = event['ResponseURL']
+              print(responseUrl)
+              responseBody = {}
+              responseBody['Status'] = responseStatus
+              responseBody['Reason'] = reason or "See the details in CloudWatch Log Stream: {}".format(context.log_stream_name)
+              responseBody['PhysicalResourceId'] = physicalResourceId or context.log_stream_name
+              responseBody['StackId'] = event['StackId']
+              responseBody['RequestId'] = event['RequestId']
+              responseBody['LogicalResourceId'] = event['LogicalResourceId']
+              responseBody['NoEcho'] = noEcho
+              responseBody['Data'] = responseData
+              json_responseBody = json.dumps(responseBody)
+              print("Response body:\n" + json_responseBody)
+              headers = {
+                  'content-type' : '',
+                  'content-length' : str(len(json_responseBody))
+              }
+              try:
+                  response = http.request('PUT',responseUrl,headers=headers,body=json_responseBody)
+                  print("Status code: {}".format(str(response.status)))
+              except Exception as e:
+                  print("send(..) failed executing requests.put(..): " + str(e))
+
+          def handler(event, context):
+              print('this is the event ' + json.dumps(event))
+              StackName = event['StackId']
+              LogicalResourceId = event['LogicalResourceId']
+              UniqueId = event['RequestId']
+              responseData = {}
+              
+              client=boto3.client('ec2')
+              try:
+                get_vpc_response = client.describe_vpcs(Filters=[{'Name': 'isDefault','Values': ['true']}])
+                vpcid=(get_vpc_response['Vpcs'][0]['VpcId'])
+                print("Default VPC ID: " + vpcid)
+                error=0
+              except Exception as e:
+                print("send(..) failed executing requests.put(..): " + str(e))
+                print("No Default VPC available")
+                error=1
+
+              if error != 1 :
+                try:
+                  error=1
+                  instances = client.describe_instances()
+                  var=str(instances)
+                  temp=var.find(vpcid)
+                  if temp == -1:
+                    print("No instance running on the VPC")
+                    error=0
+                  else:
+                    print("EC2 instance running on the Default VPC. Execution Cancelled.")
+                except Exception as e:
+                  print("send(..) failed executing requests.put(..): " + str(e))
+                  print("No EC2 instances found on Default VPC")
+                  error=0
+              
+              if error != 1 :
+                ec2 = boto3.resource('ec2')
+                ec2client = ec2.meta.client
+                vpc = ec2.Vpc(vpcid)
+                
+                for gw in vpc.internet_gateways.all():
+                  vpc.detach_internet_gateway(InternetGatewayId=gw.id)
+                  gw.delete()
+                  
+                for rt in vpc.route_tables.all():
+                  for rta in rt.associations:
+                      if not rta.main:
+                          rta.delete()
+                          
+                for sg in vpc.security_groups.all():
+                  if sg.group_name != 'default':
+                      sg.delete()
+                      
+                for netacl in vpc.network_acls.all():
+                  if not netacl.is_default:
+                      netacl.delete()
+                      
+                for subnet in vpc.subnets.all():
+                  for interface in subnet.network_interfaces.all():
+                      interface.delete()
+                  subnet.delete()
+                  
+                ec2client.delete_vpc(VpcId=vpcid) 
+                
+                print("Default VPC Removed") 
+              responseStatus = 'SUCCESS'
+              send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None)
+
+          
+      Handler: 'index.handler'
+      MemorySize: 128
+      Role: !GetAtt 'LambdaRole.Arn'
+      Runtime: 'python3.7'
+      Timeout: 60
+  VPCPolicy:
+    Type: 'Custom::VPCPolicy'
+    Version: '1.0'
+    Properties:
+      ServiceToken: !GetAtt 'VPCPolicyCustomResource.Arn'
+Outputs:
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'

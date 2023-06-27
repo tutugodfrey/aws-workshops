@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Lab 1: Multicast in AWS'
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Multicast Setup
+        Parameters:
+          - MulticastGroup
+      - Label:
+          default: EC2 Setup
+        Parameters:
+          - SourceSubnet
+          - SourceSecurityGroup
+          - MemberSubnet1
+          - MemberSecurityGroup1
+          - MemberSubnet2
+          - MemberSecurityGroup2
+          - InstanceType
+          - KeyName
+          - LatestAmiId
+    ParameterLabels:
+      MulticastGroup:
+        default: Group IP
+      SourceSubnet:
+        default: Source Subnet
+      SourceSecurityGroup:
+        default: Source Security Group
+      MemberSubnet1:
+        default: Member Subnet
+      MemberSecurityGroup1:
+        default: Member Security Group
+      MemberSubnet2:
+        default: Member Subnet
+      MemberSecurityGroup2:
+        default: Member Security Group
+      InstanceType:
+        default: EC2 Instance Type
+      KeyName:
+        default: EC2 Key Pair
+      LatestAmiId:
+        default: Latest Amazon Linux 2 AMI
+Parameters:
+  MulticastGroup:
+    Type: String
+    Description: Enter an IPv4 multicast address in the range 239.0.0.0 to 239.255.255.255.
+    AllowedPattern: ^(239(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})$
+    Default: 239.0.0.100
+  SourceSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the subnet where multicast traffic will originate.
+  SourceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+  MemberSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the first subnet where multicast traffic will be sent.
+  MemberSecurityGroup1:
+    Type: AWS::EC2::SecurityGroup::Id
+  MemberSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the second subnet where multicast traffic will be sent.
+  MemberSecurityGroup2:
+    Type: AWS::EC2::SecurityGroup::Id
+  InstanceType:
+    Type: String
+    Description: Select the instance type for the source and member instances.
+    Default: t3.micro
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+  KeyName:
+    Type: String
+    Description: '[OPTIONAL] Enter the name of an existing EC2 key pair to enable SSH access to the instance.'
+    Default: ''
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+Conditions:
+  UseIamRole:
+    Fn::Equals:
+      - Ref: KeyName
+      - ''
+Resources:
+  EC2SystemsManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: '${AWS::StackName}-SystemsManager'
+      Description: Register as managed instances within AWS Systems Manager
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+    Condition: UseIamRole
+  EC2SystemsManagerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName:
+        Fn::Sub: '${AWS::StackName}-SystemsManager'
+      Roles:
+        - Ref: EC2SystemsManagerRole
+    Condition: UseIamRole
+  RFC1918PrefixList:
+    Type: AWS::EC2::PrefixList
+    Properties:
+      AddressFamily: IPv4
+      Entries:
+        - Cidr: 10.0.0.0/8
+          Description: 24-bit block
+        - Cidr: 172.16.0.0/12
+          Description: 20-bit block
+        - Cidr: 192.168.0.0/16
+          Description: 16-bit block
+      MaxEntries: 3
+      PrefixListName:
+        Fn::Sub: '${AWS::StackName}-RFC1918'
+  MemberSecurityGroupIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      CidrIp: 0.0.0.0/32
+      Description: IGMP Query
+      GroupId:
+        Ref: MemberSecurityGroup1
+      IpProtocol: 2
+  MemberSecurityGroupIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      CidrIp: 0.0.0.0/32
+      Description: IGMP Query
+      GroupId:
+        Ref: MemberSecurityGroup2
+      IpProtocol: 2
+  MemberSecurityGroupIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Multicast Application
+      FromPort: 8123
+      GroupId:
+        Ref: MemberSecurityGroup1
+      IpProtocol: udp
+      SourcePrefixListId:
+        Ref: RFC1918PrefixList
+      ToPort: 8123
+  MemberSecurityGroupIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Multicast Application
+      FromPort: 8123
+      GroupId:
+        Ref: MemberSecurityGroup2
+      IpProtocol: udp
+      SourcePrefixListId:
+        Ref: RFC1918PrefixList
+      ToPort: 8123
+  SourceInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: Primary network interface
+      SubnetId:
+        Ref: SourceSubnet
+      GroupSet:
+        - Ref: SourceSecurityGroup
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: Multicast-Source
+  MemberInterface1:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: Primary network interface
+      SubnetId:
+        Ref: MemberSubnet1
+      GroupSet:
+        - Ref: MemberSecurityGroup1
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: Multicast-Member-1
+  MemberInterface2:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: Primary network interface
+      SubnetId:
+        Ref: MemberSubnet2
+      GroupSet:
+        - Ref: MemberSecurityGroup2
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: Multicast-Member-2
+  SourceInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 10
+      IamInstanceProfile:
+        Fn::If:
+          - UseIamRole
+          - Fn::Sub: '${AWS::StackName}-SystemsManager'
+          - Ref: AWS::NoValue
+      ImageId:
+        Ref: LatestAmiId
+      InstanceType:
+        Ref: InstanceType
+      KeyName:
+        Fn::If:
+          - UseIamRole
+          - Ref: AWS::NoValue
+          - Ref: KeyName
+      Monitoring: True
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          NetworkInterfaceId:
+            Ref: SourceInterface
+      Tags:
+        - Key: Name
+          Value: Multicast-Source
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+            yum-config-manager --enable epel
+            yum update -y
+            yum upgrade -y
+            yum install -y autoconf automake gcc git iperf
+            yum clean all
+            rm -rf /var/cache/yum
+            echo '# Force IGMPv2 for AWS Transit Gateway' > /etc/sysctl.d/01-multicast.conf
+            echo 'net.ipv4.conf.eth0.force_igmp_version = 2' >> /etc/sysctl.d/01-multicast.conf
+            wget -O /usr/bin/mcast_app https://svn.python.org/projects/python/trunk/Demo/sockets/mcast.py
+            chmod 755 /usr/bin/mcast_app
+            sed -i 's/MYTTL = 1/MYTTL = 32/g' /usr/bin/mcast_app
+            sed -i 's/225.0.0.250/${MulticastGroup}/g' /usr/bin/mcast_app
+            git clone https://github.com/troglobit/mcjoin.git /tmp/mcjoin
+            cd /tmp/mcjoin
+            ./autogen.sh
+            ./configure && make
+            make install-strip
+            cd /tmp
+            rm -rf ./*
+            reboot
+  MemberInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 10
+      IamInstanceProfile:
+        Fn::If:
+          - UseIamRole
+          - Fn::Sub: '${AWS::StackName}-SystemsManager'
+          - Ref: AWS::NoValue
+      ImageId:
+        Ref: LatestAmiId
+      InstanceType:
+        Ref: InstanceType
+      KeyName:
+        Fn::If:
+          - UseIamRole
+          - Ref: AWS::NoValue
+          - Ref: KeyName
+      Monitoring: True
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          NetworkInterfaceId:
+            Ref: MemberInterface1
+      Tags:
+        - Key: Name
+          Value: Multicast-Member-1
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+            yum-config-manager --enable epel
+            yum update -y
+            yum upgrade -y
+            yum install -y autoconf automake gcc git iperf
+            yum clean all
+            rm -rf /var/cache/yum
+            echo '# Force IGMPv2 for AWS Transit Gateway' > /etc/sysctl.d/01-multicast.conf
+            echo 'net.ipv4.conf.eth0.force_igmp_version = 2' >> /etc/sysctl.d/01-multicast.conf
+            wget -O /usr/bin/mcast_app https://svn.python.org/projects/python/trunk/Demo/sockets/mcast.py
+            chmod 755 /usr/bin/mcast_app
+            sed -i 's/MYTTL = 1/MYTTL = 32/g' /usr/bin/mcast_app
+            sed -i 's/225.0.0.250/${MulticastGroup}/g' /usr/bin/mcast_app
+            git clone https://github.com/troglobit/mcjoin.git /tmp/mcjoin
+            cd /tmp/mcjoin
+            ./autogen.sh
+            ./configure && make
+            make install-strip
+            cd /tmp
+            rm -rf ./*
+            reboot
+  MemberInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 10
+      IamInstanceProfile:
+        Fn::If:
+          - UseIamRole
+          - Fn::Sub: '${AWS::StackName}-SystemsManager'
+          - Ref: AWS::NoValue
+      ImageId:
+        Ref: LatestAmiId
+      InstanceType:
+        Ref: InstanceType
+      KeyName:
+        Fn::If:
+          - UseIamRole
+          - Ref: AWS::NoValue
+          - Ref: KeyName
+      Monitoring: True
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          NetworkInterfaceId:
+            Ref: MemberInterface2
+      Tags:
+        - Key: Name
+          Value: Multicast-Member-2
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+            yum-config-manager --enable epel
+            yum update -y
+            yum upgrade -y
+            yum install -y autoconf automake gcc git iperf
+            yum clean all
+            rm -rf /var/cache/yum
+            echo '# Force IGMPv2 for AWS Transit Gateway' > /etc/sysctl.d/01-multicast.conf
+            echo 'net.ipv4.conf.eth0.force_igmp_version = 2' >> /etc/sysctl.d/01-multicast.conf
+            wget -O /usr/bin/mcast_app https://svn.python.org/projects/python/trunk/Demo/sockets/mcast.py
+            chmod 755 /usr/bin/mcast_app
+            sed -i 's/MYTTL = 1/MYTTL = 32/g' /usr/bin/mcast_app
+            sed -i 's/225.0.0.250/${MulticastGroup}/g' /usr/bin/mcast_app
+            git clone https://github.com/troglobit/mcjoin.git /tmp/mcjoin
+            cd /tmp/mcjoin
+            ./autogen.sh
+            ./configure && make
+            make install-strip
+            cd /tmp
+            rm -rf ./*
+            reboot
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: Network-Throughput
+      DashboardBody:
+        Fn::Sub:
+          - |
+            {
+              "start": "-PT30M",
+              "periodOverride": "auto",
+              "widgets": [
+                {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 0,
+                  "height": 8,
+                  "width": 12,
+                  "properties": {
+                    "title": "Source to Members",
+                    "region": "${AWS::Region}",
+                    "stacked": false,
+                    "stat": "Sum",
+                    "period": 60,
+                    "view": "timeSeries",
+                    "yAxis": {
+                      "left": {
+                        "showUnits": false,
+                        "label": "bps"
+                      }
+                    },
+                    "metrics": [
+                      [ { "id": "e1", "region": "${AWS::Region}", "expression": "8*(m1/PERIOD(m1))", "label": "NetworkOut - Multicast-Source (${SourceInstanceId})" } ],
+                      [ { "id": "e2", "region": "${AWS::Region}", "expression": "8*(m2/PERIOD(m2))", "label": "NetworkIn - Multicast-Member-1 (${MemberInstance1Id})", "color": "#2ca02c" } ],
+                      [ { "id": "e3", "region": "${AWS::Region}", "expression": "8*(m3/PERIOD(m3))", "label": "NetworkIn - Multicast-Member-2 (${MemberInstance2Id})", "color": "#98df8a" } ],
+                      [ "AWS/EC2", "NetworkOut", "InstanceId", "${SourceInstanceId}", { "id": "m1", "visible": false, "color": "#7f7f7f" } ],
+                      [ ".", "NetworkIn", ".", "${MemberInstance1Id}", { "id": "m2", "visible": false, "color": "#7f7f7f" } ],
+                      [ ".", ".", ".", "${MemberInstance2Id}", { "id": "m3", "visible": false, "color": "#7f7f7f" } ]
+                    ]
+                  }
+                }
+              ]
+            }
+          - SourceInstanceId:
+              Ref: SourceInstance
+            MemberInstance1Id:
+              Ref: MemberInstance1
+            MemberInstance2Id:
+              Ref: MemberInstance2
+Outputs:
+  MulticastMember1:
+    Description: Multicast-Member-1 IPv4 Address
+    Value:
+      Fn::GetAtt:
+        - MemberInterface1
+        - PrimaryPrivateIpAddress
+  MulticastMember2:
+    Description: Multicast-Member-2 IPv4 Address
+    Value:
+      Fn::GetAtt:
+        - MemberInterface2
+        - PrimaryPrivateIpAddress

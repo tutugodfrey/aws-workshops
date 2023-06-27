@@ -1,0 +1,848 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Security Essentials - Lab 2 - Securing VPC Resources with Security Groups'
+
+Parameters:
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Keyname for the keypair
+
+  InstanceType:
+    Description: Amazon EC2 instance type
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t2.small
+      - t2.medium
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: AMI ID pointer in SSM. Default latest AMI Amazon Linux2
+
+  S3PathPrefix:
+    Type: String
+    Description: 'The path prefix where lab resources are stored (Leading and trailing slash required!)'
+    Default: "courses/ILT-TF-100-SIPSEE/v1.4.0.prod-29fb50ef/lab-2-SecurityGroups"
+    # Default: courses/ILT-TF-100-SECESS/v1.0.0/lab-2-SecurityGroups
+
+  AppServerPassword:
+    Type: String
+    Description: 'This string will be provided to the user so they can SSH from the Proxy Server host to the App server'
+    Default: 'AppServer-4-you'
+
+  VPCCIDR:
+    Description: 'CIDR Block for VPC'
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PubSubA:
+    Description: 'Public Subnet A'
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PubSubB:
+    Description: 'Public Subnet B'
+    Type: String
+    Default: 10.0.2.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PubSubC:
+    Description: 'Public Subnet C'
+    Type: String
+    Default: 10.0.3.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PubSubD:
+    Description: 'Public Subnet D'
+    Type: String
+    Default: 10.0.4.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PubSubE:
+    Description: 'Public Subnet E'
+    Type: String
+    Default: 10.0.5.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PubSubF:
+    Description: 'Public Subnet F'
+    Type: String
+    Default: 10.0.6.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PrivSubA:
+    Description: 'Private Subnet A'
+    Type: String
+    Default: 10.0.11.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PrivSubB:
+    Description: 'Private Subnet B'
+    Type: String
+    Default: 10.0.12.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PrivSubC:
+    Description: 'Private Subnet C'
+    Type: String
+    Default: 10.0.13.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PrivSubD:
+    Description: 'Private Subnet D'
+    Type: String
+    Default: 10.0.14.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PrivSubE:
+    Description: 'Private Subnet E'
+    Type: String
+    Default: 10.0.15.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+  PrivSubF:
+    Description: 'Private Subnet F'
+    Type: String
+    Default: 10.0.16.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+
+Conditions:
+  createSubnetB: !Equals [!FindInMap [RegionMap, !Ref "AWS::Region", SubnetB], true]
+  createSubnetC: !Equals [!FindInMap [RegionMap, !Ref "AWS::Region", SubnetC], true]
+  createSubnetD: !Equals [!FindInMap [RegionMap, !Ref "AWS::Region", SubnetD], true]
+  createSubnetE: !Equals [!FindInMap [RegionMap, !Ref "AWS::Region", SubnetE], true]
+  createSubnetF: !Equals [!FindInMap [RegionMap, !Ref "AWS::Region", SubnetF], true]
+
+### Resources Section ###
+Resources:
+  # Create VPC
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Ref VPCCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: labVPC
+
+  ### create a NAT gateway ###
+  myNAT:
+    DependsOn: VPC
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt [myEIP, AllocationId]
+      SubnetId: !Ref PublicSubnetA
+
+  myEIP:
+    DependsOn: AttachGateway
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # Users will hit EC2 instances which are running in the public subnets.
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    DependsOn: VPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: IGW
+
+  # Attached this IGW to the VPC
+  AttachGateway:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Create public subnets using conditions to decide if they are made or not.
+  PublicSubnetA:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PubSubA
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PubSubA
+        - Key: Reach
+          Value: Public
+
+  PublicSubnetB:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetB
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PubSubB
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PubSubB
+        - Key: Reach
+          Value: Public
+
+  PublicSubnetC:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PubSubC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PubSubC
+        - Key: Reach
+          Value: Public
+
+  PublicSubnetD:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetD
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PubSubD
+      AvailabilityZone: !Select [3, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PubSubD
+        - Key: Reach
+          Value: Public
+
+  PublicSubnetE:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetE
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PubSubE
+      AvailabilityZone: !Select [4, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PubSubE
+        - Key: Reach
+          Value: Public
+
+  PublicSubnetF:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetF
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PubSubF
+      AvailabilityZone: !Select [5, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PubSubF
+        - Key: Reach
+          Value: Public
+
+  # Create private subnets using conditions to decide if they are made or not.
+  PrivateSubnetA:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivSubA
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivSubA
+        - Key: Reach
+          Value: Private
+
+  PrivateSubnetB:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetB
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivSubB
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivSubB
+        - Key: Reach
+          Value: Private
+
+  PrivateSubnetC:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetC
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivSubC
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivSubC
+        - Key: Reach
+          Value: Private
+
+  PrivateSubnetD:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetD
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivSubD
+      AvailabilityZone: !Select [3, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivSubD
+        - Key: Reach
+          Value: Private
+
+  PrivateSubnetE:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetE
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivSubE
+      AvailabilityZone: !Select [4, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivSubE
+        - Key: Reach
+          Value: Private
+
+  PrivateSubnetF:
+    Type: 'AWS::EC2::Subnet'
+    Condition: createSubnetF
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivSubF
+      AvailabilityZone: !Select [5, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivSubF
+        - Key: Reach
+          Value: Private
+
+  # Create the Public Routing Tables.
+  PublicRouteTableA:
+    Type: 'AWS::EC2::RouteTable'
+    DependsOn:
+      - AttachGateway
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public
+
+  # Create the private route tables
+  PrivateRouteTableA:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private
+
+  # And add in the default route to 0.0.0.0/0
+  PublicRouteIGW:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PublicRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRouteNAT:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref myNAT
+
+  # Attach the routing table to each of the subnets
+  PublicRouteTableAssociationA:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTableA
+
+  PublicRouteTableAssociationB:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: createSubnetB
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTableA
+
+  PublicRouteTableAssociationC:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: createSubnetC
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref PublicRouteTableA
+
+  PublicRouteTableAssociationD:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: createSubnetD
+    Properties:
+      SubnetId: !Ref PublicSubnetD
+      RouteTableId: !Ref PublicRouteTableA
+
+  PublicRouteTableAssociationE:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: createSubnetE
+    Properties:
+      SubnetId: !Ref PublicSubnetE
+      RouteTableId: !Ref PublicRouteTableA
+
+  PublicRouteTableAssociationF:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Condition: createSubnetF
+    Properties:
+      SubnetId: !Ref PublicSubnetF
+      RouteTableId: !Ref PublicRouteTableA
+
+  PrivateRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: createSubnetB
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateRouteTableAssociationC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: createSubnetC
+    Properties:
+      SubnetId: !Ref PrivateSubnetC
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateRouteTableAssociationD:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: createSubnetD
+    Properties:
+      SubnetId: !Ref PrivateSubnetD
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateRouteTableAssociationE:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: createSubnetE
+    Properties:
+      SubnetId: !Ref PrivateSubnetE
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateRouteTableAssociationF:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: createSubnetF
+    Properties:
+      SubnetId: !Ref PrivateSubnetF
+      RouteTableId: !Ref PrivateRouteTableA
+
+  ### Security Groups ###
+  AppServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: AppServerSecurityGroup
+      GroupDescription: Security group for App server
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: AppServerSecurityGroup
+
+### THIS NEED TO BE MODIFIED TO NOT OPEN?? ###
+  ProxyServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: ProxyServerSecurityGroup
+      GroupDescription: Proxy Server Security Group
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ProxyServerSecurityGroup
+
+### THIS NEED TO BE MODIFIED TO NOT OPEN?? ###
+  PublicServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: PublicServerSecurityGroup
+      GroupDescription: Public Server Security Group
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: PublicServerSecurityGroup
+
+  #Linux EC2 AppServer
+  AppServer:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+        Count: 1
+    DependsOn:
+      - VPC
+      - myNAT
+    Properties:
+      AvailabilityZone: !Sub ${AWS::Region}a
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref SSMProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: false
+          SubnetId: !Ref PrivateSubnetA
+          GroupSet:
+            - !Ref AppServerSecurityGroup
+      Tags:
+        - Key: 'Name'
+          Value: 'ApplicationServer'
+        - Key: 'SecurityScan'
+          Value: 'false'
+        - Key: 'OS Group'
+          Value: 'AmazonLinux'
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -ex
+          # Install httpd Server with a simple pageVER
+          sudo yum update -y &&
+          mkdir /home/ec2-user/.aws &&
+          echo "[default]" > /home/ec2-user/.aws/config &&
+          echo "region = ${AWS::Region}" >> /home/ec2-user/.aws/config &&
+          mkdir -p /home/ssm-user/.aws &&
+          echo "[default]" > /home/ssm-user/.aws/config &&
+          echo "region = ${AWS::Region}" >> /home/ssm-user/.aws/config &&
+
+          # Allow password SSH from app server, not secure, but fine for demo resasons
+          sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config &&
+          systemctl restart sshd.service &&
+
+          # Make a file with the instance name in it for easy reference later
+          mkdir /root/.aws &&
+          echo "[default]" > /root/.aws/config &&
+          echo "region = ${AWS::Region}" >> /root/.aws/config &&
+          thisInstance=$(curl http://169.254.169.254/latest/meta-data/instance-id) &&
+          thisData=$(aws ec2 describe-instances --instance-id $thisInstance) &&
+          thisName=$(aws ec2 describe-instances --instance-id $thisInstance --filter Name=tag-key,Values=Name \
+            --query 'Reservations[*].Instances[*].{Name:Tags[?Key==`Name`]|[0].Value}' --output text) &&
+          echo "$thisData" > /home/ssm-user/$thisName.json &&
+          echo "$thisData" > /home/ec2-user/$thisName.json &&
+          sudo yum install httpd -y &&
+
+          chmod 755 /var/log/httpd &&
+
+          curl -o /home/ec2-user/website.zip https://${AWS::Region}-tcprod.s3.amazonaws.com/${S3PathPrefix}/scripts/website.zip &&
+          unzip /home/ec2-user/website.zip -d /var/www/html &&
+          chmod -R +x /var/www &&
+          chmod a+w /var/www/html &&
+
+          /usr/bin/systemctl enable httpd.service &&
+          /usr/bin/systemctl start httpd.service &&
+
+          yum install -y aws-cli &&
+
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AppServer --region ${AWS::Region}
+
+          until (( $(id -u ssm-user) )); do sleep 10; done
+          chown -R ssm-user:ssm-user /home/ssm-user/
+
+  #Command Host for SSM
+  ProxyServer:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+    DependsOn:
+      - VPC
+    Properties:
+      AvailabilityZone: !Sub ${AWS::Region}a
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref SSMProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnetA
+          GroupSet:
+            - !Ref ProxyServerSecurityGroup
+      Tags:
+        - Key: 'Name'
+          Value: 'ProxyServer'
+        - Key: 'SecurityScan'
+          Value: 'false'
+        - Key: 'OS Group'
+          Value: 'AmazonLinux'
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -ex
+          yum update -y &&
+          yum install -y aws-cli &&
+
+          /usr/sbin/sysctl net.ipv4.ip_forward=1 &&
+          /usr/sbin/iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination ${AppServer.PrivateIp}:80 &&
+          /usr/sbin/iptables -t nat -A POSTROUTING -j MASQUERADE &&
+
+          mkdir /home/ec2-user/.aws &&
+          echo "[default]" > /home/ec2-user/.aws/config &&
+          echo "region = ${AWS::Region}" >> /home/ec2-user/.aws/config &&
+          mkdir -p /home/ssm-user/.aws &&
+          echo "[default]" > /home/ssm-user/.aws/config &&
+          echo "region = ${AWS::Region}" >> /home/ssm-user/.aws/config &&
+
+          # Make a file with the instance name in it for easy reference later
+          mkdir /root/.aws &&
+          echo "[default]" > /root/.aws/config &&
+          echo "region = ${AWS::Region}" >> /root/.aws/config &&
+          thisInstance=$(curl http://169.254.169.254/latest/meta-data/instance-id) &&
+          thisData=$(aws ec2 describe-instances --instance-id $thisInstance) &&
+          thisName=$(aws ec2 describe-instances --instance-id $thisInstance --filter Name=tag-key,Values=Name \
+            --query 'Reservations[*].Instances[*].{Name:Tags[?Key==`Name`]|[0].Value}' --output text) &&
+          echo "$thisData" > /home/ssm-user/$thisName.json &&
+          echo "$thisData" > /home/ec2-user/$thisName.json &&
+
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ProxyServer --region ${AWS::Region}
+
+          until (( $(id -u ssm-user) )); do sleep 10; done
+          chown -R ssm-user:ssm-user /home/ssm-user/
+
+  #Command Host for SSM
+  PublicServer:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+    DependsOn:
+      - VPC
+    Properties:
+      AvailabilityZone: !Sub ${AWS::Region}b
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref SSMProfile
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnetB
+          GroupSet:
+            - !Ref PublicServerSecurityGroup
+      Tags:
+        - Key: 'Name'
+          Value: 'PublicServer'
+        - Key: 'SecurityScan'
+          Value: 'false'
+        - Key: 'OS Group'
+          Value: 'AmazonLinux'
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash -ex
+          yum update -y &&
+          yum install -y aws-cli &&
+
+          /usr/sbin/sysctl net.ipv4.ip_forward=1 &&
+          /usr/sbin/iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination ${AppServer.PrivateIp}:80 &&
+          /usr/sbin/iptables -t nat -A POSTROUTING -j MASQUERADE &&
+
+          mkdir /home/ec2-user/.aws &&
+          echo "[default]" > /home/ec2-user/.aws/config &&
+          echo "region = ${AWS::Region}" >> /home/ec2-user/.aws/config &&
+          mkdir -p /home/ssm-user/.aws &&
+          echo "[default]" > /home/ssm-user/.aws/config &&
+          echo "region = ${AWS::Region}" >> /home/ssm-user/.aws/config &&
+
+          # Make a file with the instance name in it for easy reference later
+          mkdir /root/.aws &&
+          echo "[default]" > /root/.aws/config &&
+          echo "region = ${AWS::Region}" >> /root/.aws/config &&
+          thisInstance=$(curl http://169.254.169.254/latest/meta-data/instance-id) &&
+          thisData=$(aws ec2 describe-instances --instance-id $thisInstance) &&
+          thisName=$(aws ec2 describe-instances --instance-id $thisInstance --filter Name=tag-key,Values=Name \
+            --query 'Reservations[*].Instances[*].{Name:Tags[?Key==`Name`]|[0].Value}' --output text) &&
+          echo "$thisData" > /home/ssm-user/$thisName.json &&
+          echo "$thisData" > /home/ec2-user/$thisName.json &&
+
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource PublicServer --region ${AWS::Region}
+
+          until (( $(id -u ssm-user) )); do sleep 10; done
+          chown -R ssm-user:ssm-user /home/ssm-user/
+
+# Instance Profile for Role
+  SSMProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      InstanceProfileName: "ProxyServer-EC2"
+      Roles:
+        - !Ref SSMRole
+
+# IAM Role for SSM
+  SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+      RoleName: "ProxyServer"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: "ProxyServer-IAM_Role"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['ssm:List*', 'ssm:Get*', 'ssm:Desc*', 'ssm:SendCommand', 'ssm:StartAutomationExecution', 'ssm:ExecuteAutomation', 'ssm:RunCommand', 'ssm:PutInventory', 'ssm:PutComplianceItems', 'ssm:PutConfigurePackageResult', 'ssm:UpdateAssociationStatus', 'ssm:UpdateInstanceAssociationStatus', 'ssm:UpdateInstanceInformation', 'ec2:Describe*', 'rds:Describe*', 'ec2messages:AcknowledgeMessage', 'ec2messages:DeleteMessage', 'ec2messages:FailMessage', 'ec2messages:GetEndpoint', 'ec2messages:GetMessages', 'ec2messages:SendReply', 'cloudwatch:PutMetricData', 'logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:DescribeLogGroups', 'logs:DescribeLogStreams', 'logs:PutLogEvents', 's3:ListBucketMultipartUploads']
+                Resource:
+                  - "*"
+
+#-----Start - Add lab user to ReadOnly group-----#
+Outputs:
+  AwsRegion:
+    Description: AWS Region the lab is running in
+    Value: !Sub ${AWS::Region}
+
+  ProxyServerUrl:
+    Description: The DNS URL for the proxy server
+    Value: !Sub http://${ProxyServer.PublicIp}
+
+  PublicServerUrl:
+    Description: The DNS URL for the public server
+    Value: !Sub http://${PublicServer.PublicIp}
+
+  ProxyServerPrivateIp:
+    Description: Private IP of the ProxyServer EC2 instance
+    Value: !Sub ${ProxyServer.PrivateIp}/32
+
+# This is a map of Regions and AZ's
+Mappings:
+  # This needs to be updated as Regions and AZ's are added.
+  RegionMap:
+    eu-north-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    ap-south-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    eu-west-3:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    eu-west-2:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    eu-west-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    ap-northeast-3:
+      SubnetA: true
+      SubnetB: false
+      SubnetC: false
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    ap-northeast-2:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    ap-northeast-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    sa-east-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: false
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    ca-central-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: false
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    ap-southeast-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    ap-southeast-2:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    eu-central-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    us-east-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: true
+      SubnetE: true
+      SubnetF: true
+    us-east-2:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    us-west-1:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: false
+      SubnetD: false
+      SubnetE: false
+      SubnetF: false
+    us-west-2:
+      SubnetA: true
+      SubnetB: true
+      SubnetC: true
+      SubnetD: true
+      SubnetE: false
+      SubnetF: false

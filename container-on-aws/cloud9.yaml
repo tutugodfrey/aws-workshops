@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  LabUserRoleName:
+    Type: String
+
+Resources:
+  AddUsersToCloud9Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AttachPolicies
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - cloud9:CreateEnvironmentMembership
+                  - cloud9:DescribeEnvironmentMemberships
+                  - cloud9:ListEnvironments
+                  - cloud9:UpdateEnvironmentMembership
+                Effect: Allow
+                Resource: "*"
+
+  AddUsersToCloud9Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 180
+      Role: !GetAtt AddUsersToCloud9Role.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+
+          cloud9 = boto3.client("cloud9")
+
+          def handler(event, context):
+              user_arn = event.get("detail").get("userIdentity").get("arn")
+
+              print(f"User ARN: {user_arn}")
+
+              for page in cloud9.get_paginator("list_environments").paginate():
+                  for environment_id in page["environmentIds"]:
+                      user_membership = None
+
+                      response = cloud9.describe_environment_memberships(
+                          environmentId=environment_id,
+                          userArn=user_arn
+                      )
+
+                      for membership in response.get("memberships", []):
+                          if membership.get("userArn") == user_arn:
+                              user_membership = membership
+
+                      if user_membership is None:
+                          print(f"Creating membership to environment: {environment_id}")
+
+                          response = cloud9.create_environment_membership(
+                              environmentId=environment_id,
+                              userArn=user_arn,
+                              permissions="read-write"
+                          )
+
+                          user_membership = response.get("membership")
+
+                      elif user_membership.get("permissions") not in ["owner", "read-write"]:
+                          print(f"Updating membership to environment: {environment_id}")
+
+                          response = cloud9.update_environment_membership(
+                              environmentId=environment_id,
+                              userArn=user_arn,
+                              permissions="read-write"
+                          )
+
+                          user_membership = response.get("membership")
+
+                      print(f"User Membership: {user_membership}")
+
+  AddUsersToCloud9Rule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.signin
+        detail-type:
+          - AWS Console Sign In via CloudTrail
+        detail:
+          eventSource:
+            - signin.amazonaws.com
+          eventName:
+            - ConsoleLogin
+          userIdentity:
+            sessionContext:
+              sessionIssuer:
+                arn:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${LabUserRoleName}
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AddUsersToCloud9Function.Arn
+          Id: !Ref AddUsersToCloud9Function
+
+  AddUsersToCloud9Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AddUsersToCloud9Function
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AddUsersToCloud9Rule.Arn

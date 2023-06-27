@@ -1,0 +1,9 @@
+#!/bin/bash
+#Script to trigger WAF rate-based rule
+COUNTER=0
+for j in `seq 1 400`;
+do
+ let COUNTER++
+ printf "Request %d\n response" $COUNTER
+ http -h strengt-Alb-VIY27RK6Z71X-2077943296.us-east-1.elb.amazonaws.com User-Agent:PHPCrawl/1.0
+done

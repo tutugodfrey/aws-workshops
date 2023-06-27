@@ -1,0 +1,469 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Base stack to create container day resources
+
+Parameters:
+  # EKS Parameters
+  Cloud9IDEInstanceType:
+    Description: The type of instance to connect to the environment
+    Type: String
+    Default: t2.micro
+
+  KubernetesVersion:
+    Description: Kubernetes version
+    Type: String
+    Default: '1.22'
+
+  EKSClusterName:
+    Description: Name of EKS Cluster
+    Type: String
+    Default: eksworkshop-eksctl
+
+Resources:
+  kubescapesecurityhubingestion:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: map kubescape findings to security hub
+      Runtime: python3.7
+      MemorySize: 512
+      Timeout: 15
+      Role: !GetAtt kubescapesecurityhubingestioniamrole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+          import random
+          import string
+          from datetime import datetime
+
+          s3_client = boto3.client('s3')
+          securityhub_client = boto3.client('securityhub')
+
+
+          def lambda_handler(event, context):
+
+              #print('Incoming Event: {0}'.format(event))
+              current_account_id = os.environ['current_account_id']
+              current_region = os.environ['current_region']
+
+              bucket_name = event['Records'][0]['s3']['bucket']['name']
+              object_key = event['Records'][0]['s3']['object']['key']
+
+              current_date_time = datetime.now()
+
+              get_object_response = s3_client.get_object(
+                  Bucket=bucket_name,
+                  Key=object_key
+              )
+
+              payload = json.loads( get_object_response['Body'].read() )
+              kubescape_controls = payload['summaryDetails']['controls']
+              findings_generation_time =  payload['generationTime']
+
+              findings = []
+
+              for control in kubescape_controls:
+                  obj = kubescape_controls[control]
+
+                  #print("control_id: {0}, control_status:{1}".format(obj['controlID'], obj['status'].upper()))
+
+                  compliance_status = obj['status'].upper()
+                  score_factor = obj['scoreFactor'] * 10
+
+                  if score_factor in range (1,39):
+                      severity_label = "LOW"
+                  elif score_factor in range (40,69):
+                      severity_label = "MEDIUM"
+                  elif score_factor in range (70,89):
+                      severity_label = "HIGH"
+                  else:
+                      severity_label = "CRITICAL"
+
+                  if compliance_status not in ['PASSED', 'FAILED']:
+                      compliance_status = "NOT_AVAILABLE"
+
+                  #print("compliance_status: {0}".format(compliance_status))
+                  #print("score_factor: {0} compliance_status: {1}".format(score_factor, severity_label))
+
+                  findings.append(
+                      {
+                          "SchemaVersion": "2018-10-08",
+                          "Id": obj['controlID'],
+                          "ProductArn": "arn:aws:securityhub:{0}:{1}:product/{1}/default".format(current_region, current_account_id),
+                          "GeneratorId": context.invoked_function_arn,
+                          "AwsAccountId": current_account_id,
+                          "Types": [
+                              "Software and Configuration Checks/AWS Config Analysis"
+                          ],
+                          "Severity": {
+                              "Label": severity_label,
+                              "Original": str(obj['scoreFactor'])
+                          },
+                          "Title": obj['name'],
+                          "Description": obj['name'],
+                          "CreatedAt": findings_generation_time,
+                          "UpdatedAt": current_date_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+
+                          "Remediation": {
+                              "Recommendation": {
+                                  "Text": "For directions on how to fix this issue, see armo docs.",
+                                  "Url": "https://hub.armo.cloud/docs/" + obj['controlID'].lower()
+                              }
+                          },
+                          "Resources": [
+                              {
+                                  "Id": random.choice(string.ascii_lowercase),
+                                  "Type": "a",
+                                  "Partition" : "aws",
+                                  "Region": current_region
+                              }
+                          ],
+                          'Compliance': {'Status': compliance_status}
+                      }
+
+                  )
+
+
+              if len(findings) > 0:
+                  firstHundred = findings[0:99]
+                  batch_import_findings_response = securityhub_client.batch_import_findings(
+                      Findings=firstHundred
+                  )
+
+              print("Findings: {0}".format(json.dumps(findings)) )
+              print("Failed to import {0} findings".format(batch_import_findings_response['FailedCount']))
+              print("Successfully imported {0} findings".format(batch_import_findings_response['SuccessCount']))
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      "SuccessCount": batch_import_findings_response['SuccessCount'],
+                      "FailedCount": batch_import_findings_response['FailedCount']
+                  })
+              }
+      Environment:
+        Variables:
+          current_region: !Ref AWS::Region
+          current_account_id: !Ref AWS::AccountId
+
+  kubescapesecurityhubingestioniamrole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: s3andsecurityhub
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - securityhub:BatchImportFindings
+                Resource: '*'
+
+  kubescapesecurityhubingestiontriggerpermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref kubescapesecurityhubingestion
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::kubescape-securityhub-${AWS::Region}-${AWS::AccountId}
+      SourceAccount: !Ref AWS::AccountId
+
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Sub kubescape-securityhub-${AWS::Region}-${AWS::AccountId}
+      Tags:
+        - Key: Description
+          Value: bucket to store kubescape findings
+      NotificationConfiguration:
+        LambdaConfigurations:
+          -
+            Event: 's3:ObjectCreated:*'
+            Function: !GetAtt kubescapesecurityhubingestion.Arn
+
+  EKSEnvironment:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties:
+      Name : containersecurity-ide
+      AutomaticStopTimeMinutes: 900
+      OwnerArn :  !Sub arn:aws:sts::${AWS::AccountId}:assumed-role/WSParticipantRole/Participant
+      Description: Use this environment to work with EKS Labs
+      InstanceType: !Ref Cloud9IDEInstanceType
+      SubnetId: !ImportValue Subnet1ID
+      Repositories:
+        - RepositoryUrl: https://github.com/fmmasood/eks-cli-init-tools
+          PathComponent: init_scripts
+
+  EKSEnvironmentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - WSParticipantRole
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub CodeBuild-${AWS::StackName}
+      ServiceRole: !Sub arn:aws:iam::${AWS::AccountId}:role/WSParticipantRole
+      Artifacts:
+        Type: NO_ARTIFACTS
+      LogsConfig:
+        CloudWatchLogs:
+          Status:  ENABLED
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:1.0
+        EnvironmentVariables:
+          - Name: CFN_RESPONSE_URL
+            Value: !Ref WaitForStackCreationHandle
+          - Name: CLOUD9_INSTANCE_PROFILE_NAME
+            Value: !Ref EKSEnvironmentInstanceProfile
+          - Name: CLOUD9_ENVIRONMENT_ID
+            Value: !Ref EKSEnvironment
+      Source:
+        Type: NO_SOURCE
+        BuildSpec:
+          !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.7
+              commands:
+                - echo ">>> installed python 3.7"
+            pre_build:
+              commands:
+                - echo ">>> build cluster config"
+                - |
+                  cat <<EOF > cluster-config.yaml
+          
+                  apiVersion: eksctl.io/v1alpha5
+                  kind: ClusterConfig
+          
+                  #Only use these availability zones
+                  availabilityZones:
+                    - ${AWS::Region}a
+                    - ${AWS::Region}b
+                    - ${AWS::Region}c
+          
+                  metadata:
+                    name: ${EKSClusterName}
+                    region: ${AWS::Region}
+                    version: "${KubernetesVersion}"
+          
+                  cloudWatch:
+                      clusterLogging:
+                          enableTypes: ["*"]
+                          logRetentionInDays: 14
+                  nodeGroups:
+                    - name: ng
+                      instanceType: m5.xlarge
+                      desiredCapacity: 2
+                      minSize: 2
+                      maxSize: 4
+                      privateNetworking: true
+                      volumeSize: 100
+                      volumeType: gp2
+                      volumeEncrypted: true
+                      disableIMDSv1 : true
+                      iam:
+                        attachPolicyARNs:
+                          - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+                          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                        attachPolicy:
+                          Version: "2012-10-17"
+                          Statement:
+                            - Effect: Allow
+                              Action:
+                                  - logs:DescribeLogGroups
+                                  - logs:DescribeLogStreams
+                                  - logs:CreateLogStream
+                                  - logs:PutLogEvents              
+                              Resource: '*'
+                  iam:
+                    withOIDC: true
+                    
+                  addons:
+                    - name:  vpc-cni
+                      attachPolicyARNs: 
+                        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+                    - name: kube-proxy
+                    - name: coredns
+          
+                  EOF
+                - echo ">>> install awscli "
+                - pip3 install --upgrade --user awscli
+                - echo ">>> install kubectl"
+                - curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/linux/amd64/kubectl
+                - chmod +x ./kubectl 
+                - curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+                - mv -v /tmp/eksctl /usr/local/bin
+                - eksctl version
+                - export PATH=$PWD/:$PATH
+            build:
+              commands:
+                - echo ">>> find instance using environment Id= $CLOUD9_ENVIRONMENT_ID"
+                - CLOUD9_INSTANCE_ID=$(aws ec2 describe-instances --filter Name=tag:aws:cloud9:environment,Values=$CLOUD9_ENVIRONMENT_ID --query Reservations[0].Instances[0].InstanceId --output text)
+                - echo ">>> cloud9 instance id= $CLOUD9_INSTANCE_ID"
+                - echo ">>> assign profile $CLOUD9_INSTANCE_PROFILE_NAME to instance $CLOUD9_INSTANCE_ID"
+                - aws ec2 associate-iam-instance-profile --instance-id $CLOUD9_INSTANCE_ID --iam-instance-profile Name=$CLOUD9_INSTANCE_PROFILE_NAME
+                - eksctl create cluster -f cluster-config.yaml
+            post_build:
+              commands: 
+                # CODEBUILD_BUILD_SUCCEEDING = 1 Set to 0 if the build is failing, or 1 if the build is succeeding.
+                - echo ">>> build status $CODEBUILD_BUILD_SUCCEEDING "
+                - |
+                  if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq "1" ]
+                  then
+                    curl -X PUT -H 'Content-Type:' --data-binary '{"Status" : "SUCCESS","Reason" : "Creation Complete", "UniqueId" : "$CODEBUILD_BUILD_ID","Data" : "Creation complete"}' $CFN_RESPONSE_URL
+                  else
+                    curl -X PUT -H 'Content-Type:' --data-binary '{"Status" : "FAILURE","Reason" : "Creation Failed", "UniqueId" : "$CODEBUILD_BUILD_ID","Data" : "See Codebuild logs for details. $CODEBUILD_LOG_PATH"}' $CFN_RESPONSE_URL
+                  fi
+      TimeoutInMinutes: 60
+
+
+  WaitForStackCreationHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  WaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    # dont start till we create a lambda function
+    DependsOn: [CustomTriggerBuild]
+    Properties:
+      Handle: !Ref WaitForStackCreationHandle
+      # wait for 55 minutes before giving up
+      Timeout: 3300
+      # success or failure signal count
+      Count: 1
+
+  CustomTriggerBuild:
+    Type: Custom::ManageCloud9IDEIamRole
+    Properties:
+      ServiceToken: !GetAtt TriggerBuildLambda.Arn
+      CodebuildProjectName: !Ref BuildProject
+
+  TriggerBuildLambdaIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: !Sub IAMPolicy-${AWS::StackName}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuildBatches
+                  - codebuild:ListReportsForReportGroup
+                  - codebuild:DescribeTestCases
+                  - codebuild:GetResourcePolicy
+                  - codebuild:StopBuild
+                  - codebuild:ListReportGroups
+                  - codebuild:DescribeCodeCoverages
+                  - codebuild:ListBuildsForProject
+                  - codebuild:RetryBuild
+                  - codebuild:UpdateProject
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuildBatch
+                  - codebuild:ListReports
+                  - codebuild:ListProjects
+                  - codebuild:BatchGetReportGroups
+                  - codebuild:ListConnectedOAuthAccounts
+                  - codebuild:BatchGetProjects
+                  - codebuild:RetryBuildBatch
+                  - codebuild:BatchGetReports
+                  - codebuild:ListCuratedEnvironmentImages
+                  - codebuild:ListSourceCredentials
+                  - codebuild:ListRepositories
+                  - codebuild:ListSharedProjects
+                  - codebuild:GetReportGroupTrend
+                  - codebuild:ListBuildBatches
+                  - codebuild:StartBuildBatch
+                  - codebuild:ListBuilds
+                  - codebuild:ListBuildBatchesForProject
+                  - codebuild:StartBuild
+                Resource: !GetAtt BuildProject.Arn
+
+  TriggerBuildLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: function to retrive User info
+      Handler: index.handler
+      Role: !GetAtt TriggerBuildLambdaIamRole.Arn
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import sys
+          import json
+          import urllib3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          http = urllib3.PoolManager()
+
+
+          codebuild_client = boto3.client('codebuild')
+
+          # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-lambda-function-code-cfnresponsemodule.html
+          def handler(event, context):
+              logger.info('Incoming Event: {0}'.format(event))
+              response = {}
+              response['PhysicalResourceId'] = 'hardcodedphyscialid'
+              response['StackId'] = event['StackId']
+              response['RequestId'] = event['RequestId']    
+              response['LogicalResourceId'] = event['LogicalResourceId']
+              cfn_response_url = event['ResponseURL']
+
+              if event['RequestType'] == 'Delete':
+                  # return 
+                  logger.info('Nothing to do. Request Type : {0}'.format(event['RequestType']))
+                  response['Status'] = 'SUCCESS'
+
+              elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+
+                try:
+                  codebuild_client.start_build(projectName=event['ResourceProperties']['CodebuildProjectName'])
+                  response['Status'] = 'SUCCESS'
+
+                except:
+                  logging.error('Error: {0}'.format(sys.exc_info() ))
+                  response['Status'] = 'FAILED'
+
+              http.request('PUT', cfn_response_url, body=json.dumps(response).encode('utf-8'), headers={'Content-Type': 'application/json'})
+              return 'Done'
+
+
+Outputs:
+  EKSCloud9EnvId:
+    Description: ID of the EKS Lab IDE
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloud9/ide/${EKSEnvironment}?region=${AWS::Region}

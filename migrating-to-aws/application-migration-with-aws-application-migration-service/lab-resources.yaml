@@ -1,0 +1,475 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Application Migration with AWS Application Migration Service
+Parameters:
+  UserId:
+    Default: awsstudent
+    Type: String
+  ResourcePrefix:
+    Type: String
+    Default: Target
+    NoEcho: true
+  AmazonLinuxAMI:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  SourceInstanceType:
+    Type: String
+    Default: t3.small
+  CIDRBase:
+    Type: String
+    Default: "10.0"
+  CIDRLength:
+    Type: String
+    Default: "21"
+  PubSubnetLength:
+    Type: String
+    Default: "24"
+  PriSubnetLength:
+    Type: String
+    Default: "23"
+  SourceVpcCidrBase:
+    Type: String
+    Default: "10.1"
+
+Resources:
+#-----Start - Networking resources-----#
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Sub ${CIDRBase}.0.0/${CIDRLength}
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PubSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      VpcId: !Ref VPC
+      CidrBlock: !Sub ${CIDRBase}.0.0/${PubSubnetLength}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-Pub-A
+
+  PubSubnetB:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      VpcId: !Ref VPC
+      CidrBlock: !Sub ${CIDRBase}.1.0/${PubSubnetLength}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-Pub-Staging
+
+  PriSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      VpcId: !Ref VPC
+      CidrBlock: !Sub ${CIDRBase}.2.0/${PriSubnetLength}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-Priv-A
+
+  PriSubnetB:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      VpcId: !Ref VPC
+      CidrBlock: !Sub ${CIDRBase}.4.0/${PriSubnetLength}
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-Priv-B
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn:
+      - PubSubnetA
+      - PubSubnetB
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-Public-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PublicRoute
+    Properties:
+      SubnetId: !Ref PubSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PublicRoute
+    Properties:
+      SubnetId: !Ref PubSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    DependsOn: PriSubnetA
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-Private-RT-A
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    DependsOn: PriSubnetB
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ResourcePrefix}-Private-RT-B
+
+  PrivateSubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PrivateRouteA
+    Properties:
+      SubnetId: !Ref PriSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateSubnetRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PrivateRouteB
+    Properties:
+      SubnetId: !Ref PriSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  NATEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: !Ref VPC
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicSubnetRouteTableAssociationA
+    Properties:
+      AllocationId: !GetAtt NATEIP.AllocationId
+      SubnetId: !Ref PubSubnetA
+
+  SourceVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Sub ${SourceVpcCidrBase}.0.0/${CIDRLength}
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Source-VPC
+
+  SourceInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Source-IGW
+
+  SourceAttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref SourceVPC
+      InternetGatewayId: !Ref SourceInternetGateway
+
+  SourcePublicSubnetA:
+    Type: AWS::EC2::Subnet
+    DependsOn: SourceAttachGateway
+    Properties:
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      VpcId: !Ref SourceVPC
+      CidrBlock: !Sub ${SourceVpcCidrBase}.0.0/${PubSubnetLength}
+      Tags:
+        - Key: Name
+          Value: Source-Pub-A
+
+  SourcePublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: SourcePublicSubnetA
+    Properties:
+      VpcId: !Ref SourceVPC
+      Tags:
+        - Key: Name
+          Value: Source-Public-RT
+
+  SourceInternetGatewayRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SourceAttachGateway
+    Properties:
+      RouteTableId: !Ref SourcePublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref SourceInternetGateway
+
+  SourcePublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: SourceInternetGatewayRoute
+    Properties:
+      SubnetId: !Ref SourcePublicSubnetA
+      RouteTableId: !Ref SourcePublicRouteTable
+#-----End - Networking resources-----#
+
+#-----Start - EC2 instance-----#
+  SourceAppServer:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - EC2InstanceProfile
+      - SourcePublicSubnetRouteTableAssociation
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: !Ref AmazonLinuxAMI
+      InstanceType: !Ref SourceInstanceType
+      SubnetId: !Ref SourcePublicSubnetA
+      SecurityGroupIds:
+        - !Ref SourceAppSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+
+          sudo yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+          sudo systemctl start amazon-ssm-agent
+      Tags:
+        - Key: Name
+          Value: Source Application Server
+
+  SourceAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: SourceAppSG
+      GroupDescription: Source Application Server Security Group
+      VpcId: !Ref SourceVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 80
+          FromPort: 80
+          CidrIp: 0.0.0.0/0
+
+  TargetAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: TargetAppSG
+      GroupDescription: Target Application Server Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 80
+          FromPort: 80
+          CidrIp: 0.0.0.0/0
+
+##Lab Access Resources
+  EC2SSMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: 'EC2SSMRole'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: 'EC2InstanceProfile'
+      Path: /
+      Roles: [!Ref 'EC2SSMRole']
+#-----End - EC2 instance-----#  
+
+#-----Start - MGN user-----#
+  MgnUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: MgnUser
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSApplicationMigrationAgentPolicy
+
+  MigrationKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref MgnUser
+#-----End - MGN user-----#
+
+#-----Start - MGN permissions-----#
+  AWSApplicationMigrationReplicationServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSApplicationMigrationReplicationServerRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSApplicationMigrationReplicationServerPolicy
+
+  AWSApplicationMigrationConversionServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSApplicationMigrationConversionServerRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSApplicationMigrationConversionServerPolicy
+
+  AWSApplicationMigrationMGHRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSApplicationMigrationMGHRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - mgn.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSApplicationMigrationMGHAccess
+
+  AWSApplicationMigrationLaunchInstanceWithDrsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSApplicationMigrationLaunchInstanceWithDrsRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/service-role/AWSElasticDisasterRecoveryEc2InstancePolicy
+
+  AWSApplicationMigrationLaunchInstanceWithSsmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSApplicationMigrationLaunchInstanceWithSsmRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  AWSApplicationMigrationAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSApplicationMigrationAgentRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - mgn.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSApplicationMigrationAgentPolicy_v2
+#-----End - MGN permissions-----#
+
+  EC2EnforcerStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${AWS::Region}-tcprod.s3.amazonaws.com/courses/ILT-TF-200-PTMIGS/v3.1.1.prod-75afe467/lab-2/scripts/enforce_ec2.yml
+      Parameters:
+        S3Bucket: !Sub '${AWS::Region}-tcprod'
+        S3CodePath: "courses/ILT-TF-200-PTMIGS/v3.1.1.prod-75afe467/lab-2/scripts"
+        TopicArn: "arn:aws:sns:us-east-1:360097715036:Lab_Fraud_Prevention-EC2-Instances"
+        AllowedRegions: "us-west-2"
+        MaxInstances: "10"
+        LabId: karamo-test
+
+#-----Start - Add lab user to ReadOnly group-----#
+Outputs:
+  Region:
+    Value: !Ref AWS::Region
+    Description: Region used for the lab
+  MigrationAccessKey:
+    Value: !Ref MigrationKey
+  MigrationSecret:
+    Value: !GetAtt MigrationKey.SecretAccessKey

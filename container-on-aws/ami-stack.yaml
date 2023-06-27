@@ -1,0 +1,733 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  This template creates a Cloud9 environment for the user, and bootstraps it using SSM Automation.
+  The parameters in the template can be modified, and additional bootstrap commands can be added to the 'GrowPartitionAndBootstrap' step.
+
+# --- Cloud9 lab.policy Requirements --- #
+#
+#  The student policy must have the following Cloud9 permission to avoid errors in Cloud9.
+#
+#        {
+#            "Action": [
+#                "cloud9:UpdateUserSettings"
+#            ],
+#            "Effect": "Allow",
+#            "Resource": "*"
+#        },
+#        {
+#            "Effect": "Allow",
+#            "Action": [
+#                "cloud9:UpdateMembershipSettings",
+#                "cloud9:UpdateEnvironmentSettings"
+#            ],
+#            "Resource": "arn:aws:cloud9:*:*:environment:Cloud9-EKS-Lab"
+#        }
+#
+# --- Cloud9 lab.policy Requirements --- #
+
+Parameters:
+  LabVpcCidr:
+    Description: The CIDR Block for the Lab's VPC.
+    Type: String
+    Default: 10.200.0.0/16
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+
+  PublicSubnetCidr:
+    Description: The CIDR Block for the Public Subnet.
+    Type: String
+    Default: 10.200.0.0/24
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(3[0-2]|[1-2][0-9]|[0-9]))$'
+
+  Cloud9VolumeSize:
+    Type: Number
+    Description: The size (in GB) of the Cloud9 EBS volume.
+    Default: 23
+
+  Cloud9InstanceType:
+    Type: String
+    Description: The instance type of the Cloud9 EC2 instance.
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.medium
+      - t2.large
+      - t3.micro
+      - t3.medium
+      - t3.large
+
+  Cloud9AutomaticStopTimeMinutes:
+    Type: Number
+    Description: The number of minutes until the Cloud9 environment is shut down after it was last used. (Should be the same as the lab duration.)
+    Default: 90
+
+  Cloud9ImageId:
+    Type: String
+    Description: The AMI alias of the image to use with Cloud9.
+    Default: amazonlinux-2-x86_64
+    AllowedValues:
+      - amazonlinux-1-x86_64
+      - amazonlinux-2-x86_64
+      - ubuntu-18.04-x86_64
+
+  S3PathPrefix:
+    Type: String
+    Description: 'The path prefix where lab resources are stored (Leading and trailing slash required!)'
+    Default: "courses/ILT-TF-200-PTCONT/v1.0.1.prod-91689c4e/lab-2"
+
+  LabPoolId:
+    Type: String
+
+  LabUserRoleName:
+    Type: String
+
+Resources:
+  ### --- Beginning of Networking Section --- ###
+
+  # --- Creates the Lab's VPC --- #
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref LabVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+        - Key: Network
+          Value: Public
+
+  # --- Creates the Internet Gateway. --- #
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: IGW
+
+  # --- Attaches the Internet Gateway to the VPC --- #
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Creates the Public Subnet --- #
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachGateway
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+      Tags:
+        - Key: Name
+          Value: Public Subnet
+
+  # --- Creates the Public Route Table --- #
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn: PublicSubnet
+    Properties:
+      VpcId: !Ref LabVPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+
+  # --- Creates a Route to the Internet Gateway --- #
+  PublicRouteIGW:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # --- Associates the Route Table to the Public Subnet --- #
+  PublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PublicRouteIGW
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ### --- End of Networking Section --- ###
+
+  CodeCommitRepo:
+    Type: 'AWS::CodeCommit::Repository'
+    Properties:
+      RepositoryName: eksLabRepo
+      RepositoryDescription: This repository contains objects to deploy in the Cloud9 environment
+      Code:
+        BranchName: main
+        S3:
+          Bucket: us-west-2-tcprod
+          Key: courses/ILT-TF-200-PTCONT/v1.0.1.prod-91689c4e/lab-2/scripts/eksLabSetup.zip
+
+  # Begin - Create Cloud9 host IAM instance profile
+  eksLabIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: eksLabRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action:
+                  - iam:CreateInstanceProfile
+                  - iam:TagRole
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:DeletePolicy
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - ecr:UploadLayerPart
+                  - iam:PutRolePolicy
+                  - ssm:GetParameter
+                  - iam:AddRoleToInstanceProfile
+                  - iam:ListInstanceProfilesForRole
+                  - iam:PassRole
+                  - iam:DetachRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - ecr:CompleteLayerUpload
+                  - iam:DeleteOpenIDConnectProvider
+                  - ecr:BatchCheckLayerAvailability
+                  - iam:DeleteInstanceProfile
+                  - iam:GetRole
+                  - iam:GetInstanceProfile
+                  - iam:GetPolicy
+                  - iam:DeleteRole
+                  - ssm:GetParameters
+                  - iam:ListInstanceProfiles
+                  - ecr:PutImage
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:CreatePolicy
+                  - iam:ListPolicyVersions
+                  - iam:GetOpenIDConnectProvider
+                  - ecr:InitiateLayerUpload
+                  - iam:TagOpenIDConnectProvider
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                Resource:
+                  - arn:aws:ssm:*:*:parameter/aws/*
+                  - arn:aws:ssm:*::parameter/aws/*
+                  - arn:aws:ecr:*:*:repository/*
+                  - arn:aws:iam::*:instance-profile/eksctl-*
+                  - arn:aws:iam::*:oidc-provider/*
+                  - arn:aws:iam::*:role/eksctl-*
+                  - arn:aws:iam::*:role/aws-service-role/eks-nodegroup.amazonaws.com/AWSServiceRoleForAmazonEKSNodegroup
+                  - arn:aws:iam::*:role/eksctl-managed-*
+                  - arn:aws:iam::*:policy/eksctl-*
+                  - arn:aws:iam::*:role/AmazonEKSLoadBalancerControllerRole
+                  - arn:aws:iam::*:role/eksRole4serviceaccount
+                  - arn:aws:iam::*:instance-profile/eks-*
+              - Sid: VisualEditor1
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - autoscaling.amazonaws.com
+                      - ec2scheduled.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - spot.amazonaws.com
+                      - spotfleet.amazonaws.com
+                      - transitgateway.amazonaws.com
+              - Sid: VisualEditor2
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - eks.amazonaws.com
+                      - eks-nodegroup.amazonaws.com
+                      - eks-fargate.amazonaws.com
+              - Sid: VisualEditor3
+                Effect: Allow
+                Action: iam:GetRole
+                Resource: arn:aws:iam::*:role/*
+              - Sid: VisualEditor4
+                Effect: Allow
+                Action: iam:CreatePolicy
+                Resource: arn:aws:iam::*:policy/AWSLoadBalancerControllerIAMPolicy
+              - Sid: VisualEditor5
+                Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:GetAuthorizationToken
+                  - cloudformation:*
+                  - elasticloadbalancing:*
+                  - autoscaling:*
+                  - cloudwatch:*
+                  - kms:DescribeKey
+                  - ec2:*
+                  - ecr:DescribeRepositories
+                  - sts:GetCallerIdentity
+                  - eks:*
+                  - logs:PutRetentionPolicy
+                  - kms:CreateGrant
+                Resource: '*'
+              - Sid: limitedSize
+                Effect: Deny
+                Action: ec2:RunInstances
+                Resource: arn:aws:ec2:*:*:instance/*
+                Condition:
+                  ForAnyValue:StringNotLike:
+                    ec2:InstanceType:
+                      - 't3.medium'
+
+  eksLabInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref eksLabIamRole
+
+  podIamPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy for k8s pods
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: VisualEditor0
+            Effect: Allow
+            Action:
+              - eks:DescribeNodegroup
+              - eks:ListNodegroups
+            Resource:
+              - arn:aws:eks:us-west-2:*:nodegroup/eks-lab-cluster/worknodes-1/*
+              - arn:aws:eks:us-west-2:*:cluster/eks-lab-cluster
+          - Sid: VisualEditor1
+            Effect: Allow
+            Action:
+              - eks:ListClusters
+              - sts:GetCallerIdentity
+            Resource: '*'
+      ManagedPolicyName: eks-lab-read-policy
+
+    # End - Create Cloud9 host IAM instance profile
+
+  # ------------------------------------------------------ #
+
+  ### --- Start of Cloud9 Section --- ###
+
+  # --- The Cloud9 environment for the lab. --- #
+  Cloud9:
+    Type: AWS::Cloud9::EnvironmentEC2
+    DependsOn: PublicRouteTableAssociation
+    Properties:
+      Name: Cloud9-EKS-Lab
+      ImageId: !Ref Cloud9ImageId
+      InstanceType: !Ref Cloud9InstanceType
+      SubnetId: !Ref PublicSubnet
+      OwnerArn:
+        Fn::Sub: arn:${AWS::Partition}:sts::${AWS::AccountId}:assumed-role/${LabUserRoleName}/${LabPoolId}
+      AutomaticStopTimeMinutes: !Ref Cloud9AutomaticStopTimeMinutes
+      Repositories:
+        - PathComponent: !GetAtt
+            - CodeCommitRepo
+            - Name
+          RepositoryUrl: !GetAtt
+            - CodeCommitRepo
+            - CloneUrlHttp
+  Cloud9InstancePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Provides access to the AWS resources required by the Cloud9 EC2 instance during bootstrapping.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: RegionPinning
+            NotAction:
+              - cloudfront:*
+              - health:*
+              - iam:*
+              - route53:*
+              - sts:*
+              - waf:*
+            Effect: Deny
+            Resource: "*"
+            Condition:
+              ForAnyValue:StringNotEquals:
+                aws:RequestedRegion:
+                  - !Ref AWS::Region
+
+  # --- The IAM role that is meant to be assumed by the Cloud9 EC2 instance while the SSM Automation is running the 'GrowPartitionAndBootstrap' step. --- #
+  Cloud9InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Meant to be assumed by the Cloud9 EC2 instance while the SSM Automation is running the 'GrowPartitionAndBootstrap' step.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+        - !Ref Cloud9InstancePolicy
+
+  # --- The IAM instance profile to be associated with the Cloud9 EC2 instance during bootstrapping.  --- #
+  Cloud9InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Cloud9InstanceRole
+
+  # --- The IAM managed policy that provides access to the AWS resources required by the SSM Automation for Cloud9. --- #
+  Cloud9AutomationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Provides access to the AWS resources required by the SSM Automation for Cloud9.
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ModifyVolume
+            Action:
+              - ec2:DescribeVolumes
+              - ec2:ModifyVolume
+            Effect: Allow
+            Resource: "*"
+          - Sid: BootstrapProfileManagement
+            Action:
+              - ec2:AssociateIamInstanceProfile
+              - ec2:DisassociateIamInstanceProfile
+              - ec2:DescribeIamInstanceProfileAssociations
+              - ec2:RebootInstances
+            Effect: Allow
+            Resource: "*"
+          - Sid: BootstrapPassRole
+            Action:
+              - iam:PassRole
+            Effect: Allow
+            Resource:
+              - !GetAtt Cloud9InstanceRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: ec2.amazonaws.com
+          - Sid: BootstrapCleanup
+            Action:
+              - iam:DeletePolicy
+              - iam:DeleteRole
+              - iam:DetachRolePolicy
+              - iam:RemoveRoleFromInstanceProfile
+            Effect: Allow
+            Resource:
+              - !Ref Cloud9InstancePolicy
+              - !GetAtt Cloud9InstanceProfile.Arn
+              - !GetAtt Cloud9InstanceRole.Arn
+              - !Sub arn:aws:iam::${AWS::AccountId}:policy/*-Cloud9AutomationPolicy-*
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/*-Cloud9AutomationRole-*
+          - Sid: RegionPinning
+            NotAction:
+              - cloudfront:*
+              - health:*
+              - iam:*
+              - route53:*
+              - sts:*
+              - waf:*
+            Effect: Deny
+            Resource: "*"
+            Condition:
+              ForAnyValue:StringNotEquals:
+                aws:RequestedRegion:
+                  - !Ref AWS::Region
+
+  # --- The IAM role that is meant to be assumed by the SSM Automation for Cloud9. --- #
+  Cloud9AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Meant to be assumed by the SSM Automation for Cloud9.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+        - !Ref Cloud9AutomationPolicy
+
+  # --- The SSM Automation document containing the steps to bootstrap the Cloud9 EC2 instance. --- #
+  # The steps in this document resize the Cloud9 volume and grow the volume partition.
+  # Additional commands can be added to 'GrowPartitionAndBootstrap' step, which will then be run on the Cloud9 Instance.
+  Cloud9Automation:
+    DependsOn: Cloud9
+    Type: AWS::SSM::Document
+    Properties:
+      Name: Cloud9Automation
+      TargetType: /AWS::EC2::Instance
+      DocumentType: Automation
+      Content:
+        description: |-
+          This automation resizes a Cloud9 volume, and runs additional bootstrapping commands.
+        schemaVersion: "0.3"
+        assumeRole: !GetAtt Cloud9AutomationRole.Arn
+        parameters:
+          InstanceId:
+            type: String
+            description: (Required) The identifier of the instance.
+          SizeGB:
+            type: Integer
+            description: (Required) The the new size for the volume.
+            default: !Ref Cloud9VolumeSize
+          DeviceName:
+            type: String
+            description: (Required) The device name (such as /dev/xvda) to be resized.
+            allowedPattern: ^[/a-zA-Z0-9]{1,40}$
+            default: /dev/xvda
+          PartitionNum:
+            type: String
+            description: (Required) The partition number of the device to resize.
+            default: "1"
+        mainSteps:
+          # --- 1. Associates the Cloud9 instance profile with the Cloud9 instance. This is required to run the commands in the step 'GrowPartitionAndBootstrap' below. --- #
+          - name: AssociateIamInstanceProfile
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: ec2
+              Api: AssociateIamInstanceProfile
+              InstanceId: "{{ InstanceId }}"
+              IamInstanceProfile:
+                Name: !Ref Cloud9InstanceProfile
+            outputs:
+              - Name: AssociationId
+                Selector: $.IamInstanceProfileAssociation.AssociationId
+                Type: String
+              - Name: VolumeId
+                Selector: $.Volumes[0].VolumeId
+                Type: String
+
+          # --- 2. Identifies the VolumeId and the Current Size (in GB) of the volume. These variables are used in the steps below. --- #
+          - name: GetVolumeData
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: ec2
+              Api: DescribeVolumes
+              Filters:
+                - Name: attachment.device
+                  Values:
+                    - "{{ DeviceName }}"
+                - Name: attachment.instance-id
+                  Values:
+                    - "{{ InstanceId }}"
+            outputs:
+              - Name: VolumeId
+                Selector: $.Volumes[0].VolumeId
+                Type: String
+              - Name: CurrentSizeGiB
+                Selector: $.Volumes[0].Size
+                Type: Integer
+
+          # --- 3. Modifies the size of your Cloud9 volume. --- #
+          - name: ModifyVolume
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: ec2
+              Api: ModifyVolume
+              VolumeId: "{{ GetVolumeData.VolumeId }}"
+              Size: "{{ SizeGB }}"
+
+          # --- 4. Waits for the Cloud9 volume to be resized and the instance profile to be associated. --- #
+          - name: WaitForVolumeResizeAndInstanceProfile
+            action: aws:executeScript
+            onFailure: Abort
+            inputs:
+              Runtime: python3.8
+              Handler: script_handler
+              Script: |
+                from time import sleep
+                import boto3
+
+                def script_handler(params: dict, context):
+                    ec2 = boto3.client("ec2")
+                    while True:
+                        response = ec2.describe_volumes(VolumeIds=[params["VolumeId"]])
+                        if response["Volumes"][0]["Size"] == params["SizeGib"]:
+                            break
+                        print(f"Sleeping for 5 seconds because the volume size (in GB) is still: {str(response['Volumes'][0]['Size'])}")
+                        sleep(5)
+                    print(f"The volume size (in GB) is now: {response['Volumes'][0]['Size']}")
+                    while True:
+                        response = ec2.describe_iam_instance_profile_associations(AssociationIds=[params["AssociationId"]])
+                        if response["IamInstanceProfileAssociations"][0]["State"] == "associated":
+                            break
+                        print(f"Sleeping for 5 seconds because the instance profile association's state is: {str(response['IamInstanceProfileAssociations'][0]['State'])}")
+                        sleep(5)
+                    print(f"The instance profile association's state is now: {response['IamInstanceProfileAssociations'][0]['State']}")
+                    return {}
+              InputPayload:
+                SizeGib: "{{ SizeGB }}"
+                VolumeId: "{{ GetVolumeData.VolumeId }}"
+                AssociationId: "{{ AssociateIamInstanceProfile.AssociationId }}"
+
+          # --- 5. Reboots the Cloud9 instance to speed up the SSM agent availability. --- #
+          - name: RebootInstance
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: ec2
+              Api: RebootInstances
+              InstanceIds:
+                - "{{ InstanceId }}"
+
+          # --- 6. Grows the Cloud9 partition, and also allows for additional Cloud9 bootstrap commands. --- #
+          - name: GrowPartitionAndBootstrap
+            action: aws:runCommand
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - "{{ InstanceId }}"
+              Parameters:
+                commands:
+                  # --- Commands required to grow the Cloud9 partition --- #
+                  - sudo growpart '{{ DeviceName }}' '{{ PartitionNum }}'
+                  - sudo xfs_growfs -d /
+                  # --- PUT ANY ADDITIONAL CLOUD9 BOOTSTRAP COMMANDS BELOW HERE. --- #
+
+          # --- 7. Disassociates the Cloud9 instance profile from the Cloud9 instance for security reasons. --- #
+          - name: DisassociateIamInstanceProfile
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: ec2
+              Api: disassociate_iam_instance_profile
+              AssociationId: "{{ AssociateIamInstanceProfile.AssociationId }}"
+
+          # --- 8. Removes the Cloud9 instance's role from the Cloud9 instance profile for security reasons. --- #
+          - name: RemoveCloud9InstanceRoleFromInstanceProfile
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: RemoveRoleFromInstanceProfile
+              InstanceProfileName: !Ref Cloud9InstanceProfile
+              RoleName: !Ref Cloud9InstanceRole
+
+          # --- 9. Detaches the 'AmazonSSMManagedInstanceCore' policy from the Cloud9 instance's role for security reasons. --- #
+          - name: DetachAmazonSSMManagedInstanceCorePolicy
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DetachRolePolicy
+              PolicyArn: arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+              RoleName: !Ref Cloud9InstanceRole
+
+          # --- 10. Detaches the 'ReadOnlyAccess' policy from the Cloud9 instance's role for security reasons. --- #
+          - name: DetachReadOnlyAccessPolicy
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DetachRolePolicy
+              PolicyArn: arn:aws:iam::aws:policy/ReadOnlyAccess
+              RoleName: !Ref Cloud9InstanceRole
+
+          # --- 11. Detaches the Cloud9 instance's policy from the Cloud9 instance's role for security reasons. --- #
+          - name: DetachCloud9InstancePolicy
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DetachRolePolicy
+              PolicyArn: !Ref Cloud9InstancePolicy
+              RoleName: !Ref Cloud9InstanceRole
+
+          # --- 12. Deletes the Cloud9 instance's policy for security reasons. --- #
+          - name: DeleteCloud9InstancePolicy
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DeletePolicy
+              PolicyArn: !Ref Cloud9InstancePolicy
+
+          # --- 13. Deletes the Cloud9 instance's role for security reasons. --- #
+          - name: DeleteCloud9InstanceRole
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DeleteRole
+              RoleName: !Ref Cloud9InstanceRole
+
+          # --- 14. Detaches the 'AmazonSSMAutomationRole' policy from the Cloud9 automation's role for security reasons. --- #
+          - name: DetachAmazonSSMAutomationRolePolicy
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DetachRolePolicy
+              PolicyArn: arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+              RoleName: !Ref Cloud9AutomationRole
+
+          # --- 15. Detaches the Cloud9 automation's policy from the Cloud9 automation's role for security reasons. --- #
+          - name: DetachCloud9AutomationPolicy
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DetachRolePolicy
+              PolicyArn: !Ref Cloud9AutomationPolicy
+              RoleName: !Ref Cloud9AutomationRole
+
+          # --- 16. Deletes the Cloud9 automation's policy for security reasons.  --- #
+          - name: DeleteCloud9AutomationPolicy
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DeletePolicy
+              PolicyArn: !Ref Cloud9AutomationPolicy
+
+          # --- 17. Deletes the Cloud9 automation's role for security reasons.  --- #
+          - name: DeleteCloud9AutomationRole
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: iam
+              Api: DeleteRole
+              RoleName: !Ref Cloud9AutomationRole
+
+
+  # --- The SSM association which will run the bootstrap automation against the Cloud9 instance. --- #
+  Cloud9Association:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: Cloud9Association
+      Name: !Ref Cloud9Automation
+      AutomationTargetParameterName: InstanceId
+      Targets:
+        - Key: tag:aws:cloud9:environment
+          Values:
+            - !Ref Cloud9
+      WaitForSuccessTimeoutSeconds: 541
+
+  ### --- End of Cloud9 Section --- ###
+
+  # --- Provides the user read only access for any lab platform supported by Kaizen. --- #

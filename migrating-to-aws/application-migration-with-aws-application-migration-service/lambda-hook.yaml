@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates and hooks up lambda to enforce a max number of ec2 instances
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Default: 'aws-tc-largeobjects'
+  S3CodePath:
+    Type: String
+    Default: 'prevention/zipped_code'
+  TopicArn:
+    Type: String
+    Default: 'arn:aws:sns:us-east-1:360097715036:Lab_Fraud_Prevention-EC2-Instances'
+  AllowedRegions:
+    Type: String
+    AllowedPattern: '.+-.+-\d(,.+-.+-\d)*'
+    Description: A comma-separated list of AWS regions
+    ConstraintDescription: must contain a comma-separated list of AWS regions. We assume regions are like us-east-1 (two dashes, digit at the end)
+    Default: us-west-2
+  MaxInstances:
+    Type: Number
+    MaxValue: 10
+    MinValue: 1
+    Default: 1
+    Description: The maximum number of ec2 instances allowed
+  LabId:
+    Type: String
+    Description: An identifier for the lab
+    Default: "SPL-unknown"
+
+Resources:
+  LambdaIamRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        -
+          PolicyName: "LambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - ec2:*
+                Resource: "*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+
+  RulesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Ec2NumInstancesEnforcer
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventRule.Arn
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "EventRule"
+      EventPattern:
+        source:
+          -  "aws.ec2"
+        detail-type:
+          - "EC2 Instance State-change Notification"
+        detail:
+          state: ["running"]
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !GetAtt Ec2NumInstancesEnforcer.Arn
+          Id: Lambda1
+
+  Ec2NumInstancesEnforcer:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: Ec2NumInstancesEnforcer
+      Handler: enforce_ec2.handler
+      Role: !GetAtt LambdaIamRole.Arn
+      Runtime: python3.9
+      Environment:
+        Variables:
+          ALLOWED_REGIONS: !Sub "${AllowedRegions}"
+          MAX_INSTANCES: !Sub "${MaxInstances}"
+          TOPIC_ARN: !Sub "${TopicArn}"
+          STACK_ID: !Sub "${AWS::StackId}"
+          LAB_ID: !Sub "${LabId}"
+      Code:
+        S3Bucket: !Sub ${S3Bucket}
+        S3Key: !Sub ${S3CodePath}/enforce_ec2.zip

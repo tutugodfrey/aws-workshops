@@ -1,0 +1,98 @@
+# Deploy Cloud Resources with AWS Service Catalog
+
+Sample Cloudformation Template for creating ec2
+
+```bash
+https://us-west-2-tcprod.s3.amazonaws.com/courses/ILT-TF-200-PTSECT/v1.4.1.prod-10755fbd/lab-1/scripts/EC2-instance-catalog-item.yaml
+```
+
+```bash
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to deploy an EC2 instance from AWS Service Catalog
+
+Parameters:
+  Subnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the subnet to add the instance to.
+
+  OperatingSystem:
+    Type: String
+    Description: Select the operating system to use on instance.
+    AllowedValues:
+      - AmazonLinux2
+      - WindowsServer2019
+    Default: AmazonLinux2
+
+  InstanceName:
+    Type: String
+    Description: Enter a name for the EC2 instance.
+    Default: instance1
+
+  InstanceType:
+    Type: String
+    Description: Select the instance type to deploy.
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+    Default: t3.micro
+
+  LatestAL2AmiId: # Locate latest Amazon Linux 2 AMI from public parameter store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: Path to the latest Amazon Linux 2 AMI from the AWS Systems Manager Parameter Store.
+
+  LatestWS2019AmiId: # Locate latest Windows Server 2019 AMI from public parameter store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base
+    Description: Path to the latest Windows Server 2019 AMI from the AWS Systems Manager Parameter Store.
+
+Conditions:
+  isLinux: !Equals
+    - !Ref OperatingSystem
+    - AmazonLinux2
+
+Resources:
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !If [isLinux, !Ref LatestAL2AmiId, !Ref LatestWS2019AmiId]
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref Subnet
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            DeleteOnTermination: true
+            VolumeType: gp2
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+
+Outputs:
+  InstanceId:
+    Description: The instance ID of the instance created from AWS Service Catalog.
+    Value: !Ref Instance
+
+  InstancePrivateIp:
+    Description: The private IP address of the instance created from AWS Service Catalog.
+    Value: !GetAtt Instance.PrivateIp
+
+  InstancePrivateDns:
+    Description: The private DNS name of the instance created from AWS Service Catalog.
+    Value: !GetAtt Instance.PrivateDnsName
+
+  InstanceAz:
+    Description: The Availability Zone of the instance created from AWS Service Catalog.
+    Value: !GetAtt Instance.AvailabilityZone
+
+  InstanceName:
+    Description: The instance name tagged at the time of provisioning.
+    Value: !Ref InstanceName
+```
+
+
+S3 Bucket
+
+```bash
+https://us-west-2-tcprod.s3.amazonaws.com/courses/ILT-TF-200-PTSECT/v1.4.1.prod-10755fbd/lab-1/scripts/S3-bucket-catalog-item.yaml
+```

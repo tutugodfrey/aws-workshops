@@ -1,0 +1,1558 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  EnableDetective:
+    Type: String
+    Default: "False"
+    AllowedValues:
+      - "False"
+      - "True"
+
+Conditions:
+  CreateDetectiveResources: !Equals [!Ref "EnableDetective", "True"]
+Resources:
+
+
+  ## Below this comment will be used to enable Detective and recreate workshop findings
+
+  ## Creating an EventBridge rule, Lambda, and resource to enable Detective. The eventBridge rule will be set
+  ## to initiate the Lambda within 25 hours. The Lambda will rerun this template, enabling Detective, and recreate
+  ## all findings.
+
+  EnablementLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+
+  EnablementLambdaPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: EnablementLambdaPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Sid: EnablementLambdaPolicy
+            Effect: Allow
+            Action:
+              - "kms:*"
+              - "detective:*"
+              - "ssm:*"
+              - "cloudformation:*"
+              - "ec2:*"
+            Resource: "*"
+          - Sid: Passrolepolicy
+            Effect: Allow
+            Action:
+              - "iam:passrole"
+              - "iam:getrole"
+            Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/IAMEC2ROLE'
+      Roles:
+        - !Ref EnablementLambdaRole
+
+  EnablementLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      TracingConfig:
+        Mode: Active
+      Runtime: python3.9
+      Role: !GetAtt
+      - EnablementLambdaRole
+      - Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+              cft_client = boto3.client('cloudformation')
+
+              stacks = cft_client.list_stacks()
+              for stack in stacks['StackSummaries']:
+                if 'cfn' in stack['StackName']:
+                  stack_update = cft_client.update_stack(
+                    StackName=stack['StackName'],
+                    UsePreviousTemplate=True,
+                    Parameters=[
+                        {
+                            'ParameterKey': 'EnableDetective',
+                            'ParameterValue': 'True'
+                        },
+                    ],
+                    Capabilities=[
+                        'CAPABILITY_IAM',
+                        'CAPABILITY_NAMED_IAM',
+                        'CAPABILITY_AUTO_EXPAND',
+                    ]
+                  )
+                  print(stack_update)
+                else:
+                    print('Not the right template to update.')
+
+  EnablementLambdaEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: default
+      Name: EnablementLambdaEventRule
+      ScheduleExpression: rate(25 hours)
+      State: ENABLED
+      Targets:
+        - 
+          Id: "TargetEnablementLamba"
+          Arn: !GetAtt
+            - EnablementLambda
+            - Arn
+    
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "EnablementLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "EnablementLambdaEventRule"
+          - "Arn"
+
+  Detective:
+    Condition: CreateDetectiveResources
+    Type: AWS::Detective::Graph
+
+
+  GeneralInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM'
+        - 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+      Path: /
+      Policies:
+        - PolicyName: GeneralInstancePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:DescribeParameters'
+                Resource: !Join 
+                  - ':'
+                  - - 'arn:aws:ssm'
+                    - !Ref 'AWS::Region'
+                    - !Ref 'AWS::AccountId'
+                    - '*'
+  GeneralInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref GeneralInstanceRole
+  IAMEC2ROLE:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - 'arn:aws:iam::aws:policy/AmazonSSMPatchAssociation'
+        - 'arn:aws:iam::aws:policy/AdministratorAccess'
+      RoleName: IAMEC2ROLE
+  IAMEC2InstanceRole:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref IAMEC2ROLE
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  EKSDemoRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - eks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'
+      Path: /
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+  GatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  RouteTable:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute:
+    DependsOn:
+      - GatewayAttachment
+    Type: 'AWS::EC2::Route'
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+  Subnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone : "us-east-1a"
+      CidrBlock: 10.0.0.0/24
+      VpcId: !Ref VPC
+  Subnet2:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone : "us-east-1b"
+      CidrBlock: 10.0.1.0/24
+      VpcId: !Ref VPC
+  Subnet3:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone : "us-east-1c"
+      CidrBlock: 10.0.2.0/24
+      VpcId: !Ref VPC
+  SubnetAssoc1:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet1
+  SubnetAssoc2:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet2
+  SubnetAssoc3:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet3
+  GeneralSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: No inbound ports required
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+          Description: Allow all ports outbound
+      VpcId: !Ref VPC
+  EKSDemoKey:
+    Type: 'AWS::EC2::KeyPair'
+    Properties:
+      KeyName: eks-demo-key
+  EnableGuardDuty:
+    Type: 'AWS::GuardDuty::Detector'
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      
+  EKSEc2InstanceForDetective:
+    Condition: CreateDetectiveResources
+    DependsOn:
+      - GatewayAttachment
+      - PublicRoute
+      - EKSDemoKey
+      - EnableGuardDuty
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      IamInstanceProfile: !Ref IAMEC2InstanceRole
+      InstanceType: m4.large
+      ImageId: !Ref LatestAmiId
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref GeneralSecurityGroup
+          SubnetId: !Ref Subnet1
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          export PATH=$PATH:/usr/local/bin
+          sudo yum update -y
+          curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+          curl -o /tmp/kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.20.4/2021-04-12/bin/linux/amd64/kubectl
+          chmod +x /tmp/kubectl
+          sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          alias kubectl='/usr/local/bin/kubectl'
+
+          eksctl create cluster --name Detective-Demo --region us-east-1 --zones us-east-1a,us-east-1b,us-east-1c --with-oidc --ssh-public-key eks-demo-key --managed
+
+          # Wait for EKS deployment
+
+          sleep 6000
+
+          aws eks update-kubeconfig --region us-east-1 --name Detective-Demo
+
+          # Create Kubernetes/ExposedDashboard
+
+          
+          cat <<'EOT' >> /tmp/k8s-dashboard.yaml
+
+          apiVersion: v1
+
+          kind: Namespace
+
+          metadata:
+            name: kubernetes-dashboard
+
+          ---
+
+
+          apiVersion: v1
+
+          kind: ServiceAccount
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+
+          ---
+
+
+          kind: Service
+
+          apiVersion: v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+          spec:
+            ports:
+              - port: 443
+                targetPort: 8443
+            selector:
+              k8s-app: kubernetes-dashboard
+
+          ---
+
+
+          apiVersion: v1
+
+          kind: Secret
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard-certs
+            namespace: kubernetes-dashboard
+          type: Opaque
+
+
+          ---
+
+
+          apiVersion: v1
+
+          kind: Secret
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard-csrf
+            namespace: kubernetes-dashboard
+          type: Opaque
+
+          data:
+            csrf: ""
+
+          ---
+
+
+          apiVersion: v1
+
+          kind: Secret
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard-key-holder
+            namespace: kubernetes-dashboard
+          type: Opaque
+
+
+          ---
+
+
+          kind: ConfigMap
+
+          apiVersion: v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard-settings
+            namespace: kubernetes-dashboard
+
+          ---
+
+
+          kind: Role
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+          rules:
+            # Allow Dashboard to get, update and delete Dashboard exclusive secrets.
+            - apiGroups: [""]
+              resources: ["secrets"]
+              resourceNames: ["kubernetes-dashboard-key-holder", "kubernetes-dashboard-certs", "kubernetes-dashboard-csrf"]
+              verbs: ["get", "update", "delete"]
+              # Allow Dashboard to get and update 'kubernetes-dashboard-settings' config map.
+            - apiGroups: [""]
+              resources: ["configmaps"]
+              resourceNames: ["kubernetes-dashboard-settings"]
+              verbs: ["get", "update"]
+              # Allow Dashboard to get metrics.
+            - apiGroups: [""]
+              resources: ["services"]
+              resourceNames: ["heapster", "dashboard-metrics-scraper"]
+              verbs: ["proxy"]
+            - apiGroups: [""]
+              resources: ["services/proxy"]
+              resourceNames: ["heapster", "http:heapster:", "https:heapster:", "dashboard-metrics-scraper", "http:dashboard-metrics-scraper"]
+              verbs: ["get"]
+
+          ---
+
+
+          kind: ClusterRole
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+          rules:
+            # Allow Metrics Scraper to get metrics from the Metrics server
+            - apiGroups: ["metrics.k8s.io"]
+              resources: ["pods", "nodes"]
+              verbs: ["get", "list", "watch"]
+
+          ---
+
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          kind: RoleBinding
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: kubernetes-dashboard
+          subjects:
+            - kind: ServiceAccount
+              name: kubernetes-dashboard
+              namespace: kubernetes-dashboard
+
+          ---
+
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          kind: ClusterRoleBinding
+
+          metadata:
+            name: kubernetes-dashboard
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: kubernetes-dashboard
+          subjects:
+            - kind: ServiceAccount
+              name: kubernetes-dashboard
+              namespace: kubernetes-dashboard
+
+          ---
+
+
+          kind: Deployment
+
+          apiVersion: apps/v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+          spec:
+            replicas: 1
+            revisionHistoryLimit: 10
+            selector:
+              matchLabels:
+                k8s-app: kubernetes-dashboard
+            template:
+              metadata:
+                labels:
+                  k8s-app: kubernetes-dashboard
+              spec:
+                containers:
+                  - name: kubernetes-dashboard
+                    image: kubernetesui/dashboard:v2.0.0
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 8443
+                        protocol: TCP
+                    args:
+                      - --enable-skip-login
+                      - --disable-settings-authorizer
+                      - --auto-generate-certificates
+                      - --namespace=kubernetes-dashboard
+                      # Uncomment the following line to manually specify Kubernetes API server Host
+                      # If not specified, Dashboard will attempt to auto discover the API server and connect
+                      # to it. Uncomment only if the default does not work.
+                      # - --apiserver-host=http://my-address:port
+                    volumeMounts:
+                      - name: kubernetes-dashboard-certs
+                        mountPath: /certs
+                        # Create on-disk volume to store exec logs
+                      - mountPath: /tmp
+                        name: tmp-volume
+                    livenessProbe:
+                      httpGet:
+                        scheme: HTTPS
+                        path: /
+                        port: 8443
+                      initialDelaySeconds: 30
+                      timeoutSeconds: 30
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      runAsUser: 1001
+                      runAsGroup: 2001
+                volumes:
+                  - name: kubernetes-dashboard-certs
+                    secret:
+                      secretName: kubernetes-dashboard-certs
+                  - name: tmp-volume
+                    emptyDir: {}
+                serviceAccountName: kubernetes-dashboard
+                nodeSelector:
+                  "kubernetes.io/os": linux
+                # Comment the following tolerations if Dashboard must not be deployed on master
+                tolerations:
+                  - key: node-role.kubernetes.io/master
+                    effect: NoSchedule
+
+          ---
+
+
+          kind: Service
+
+          apiVersion: v1
+
+          metadata:
+            labels:
+              k8s-app: dashboard-metrics-scraper
+            name: dashboard-metrics-scraper
+            namespace: kubernetes-dashboard
+          spec:
+            ports:
+              - port: 8000
+                targetPort: 8000
+            selector:
+              k8s-app: dashboard-metrics-scraper
+
+          ---
+
+
+          kind: Deployment
+
+          apiVersion: apps/v1
+
+          metadata:
+            labels:
+              k8s-app: dashboard-metrics-scraper
+            name: dashboard-metrics-scraper
+            namespace: kubernetes-dashboard
+          spec:
+            replicas: 1
+            revisionHistoryLimit: 10
+            selector:
+              matchLabels:
+                k8s-app: dashboard-metrics-scraper
+            template:
+              metadata:
+                labels:
+                  k8s-app: dashboard-metrics-scraper
+                annotations:
+                  seccomp.security.alpha.kubernetes.io/pod: 'runtime/default'
+              spec:
+                containers:
+                  - name: dashboard-metrics-scraper
+                    image: kubernetesui/metrics-scraper:v1.0.4
+                    ports:
+                      - containerPort: 8000
+                        protocol: TCP
+                    livenessProbe:
+                      httpGet:
+                        scheme: HTTP
+                        path: /
+                        port: 8000
+                      initialDelaySeconds: 30
+                      timeoutSeconds: 30
+                    volumeMounts:
+                    - mountPath: /tmp
+                      name: tmp-volume
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      runAsUser: 1001
+                      runAsGroup: 2001
+                serviceAccountName: kubernetes-dashboard
+                nodeSelector:
+                  "kubernetes.io/os": linux
+                # Comment the following tolerations if Dashboard must not be deployed on master
+                tolerations:
+                  - key: node-role.kubernetes.io/master
+                    effect: NoSchedule
+                volumes:
+                  - name: tmp-volume
+                    emptyDir: {}
+          EOT
+
+          # kubectl apply -f /tmp/k8s-dashboard.yaml
+
+          ### Kubernetes/ExposedDashboard
+
+          cat <<'EOT' >> /tmp/expose_k8s_dashboard.yaml
+
+          apiVersion: v1
+
+          kind: Service
+
+          metadata:
+            name: kubernetes-dashboard-lb
+            namespace: kubernetes-dashboard
+          spec:
+            type: LoadBalancer
+            ports:
+              - port: 443
+                protocol: TCP
+                targetPort: 8443
+            selector:
+              k8s-app: kubernetes-dashboard
+          EOT
+
+          # kubectl apply -f /tmp/expose_k8s_dashboard.yaml
+
+          ### Finding type: Policy:Kubernetes/AnonymousAccessGranted
+
+          cat <<'EOT' >> /tmp/anonymous.yaml
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          kind: ClusterRoleBinding
+
+          metadata:
+            name: anonymous-admin
+          subjects:
+            - kind: User
+              name: system:anonymous
+              namespace: default
+          roleRef:
+            kind: ClusterRole
+            name: view
+            apiGroup: rbac.authorization.k8s.io
+          EOT
+
+          # /usr/local/bin/kubectl apply -f /tmp/anonymous.yaml
+
+          ### Impact:Kubernetes/SuccessfulAnonymousAccess
+          ### Discovery:Kubernetes/SuccessfulAnonymousAccess
+
+          CERT=`cat ~/.kube/config |grep certificate |cut -f2 -d: | sed 's/^//'`
+
+          NAME=`cat ~/.kube/config  | grep "\- name:" |cut -f3 -d" "`
+
+          SERVER=`cat ~/.kube/config |grep "server:" |cut -f6 -d " "`
+
+          touch /tmp/anonymous-kubeconfig
+
+          echo "apiVersion: v1">>/tmp/anonymous-kubeconfig
+          echo "clusters:" >>/tmp/anonymous-kubeconfig
+          echo "- cluster:" >>/tmp/anonymous-kubeconfig
+          echo "    certificate-authority-data: $CERT">>/tmp/anonymous-kubeconfig
+          echo "    server: $SERVER" >>/tmp/anonymous-kubeconfig
+          echo "  name: $NAME" >>/tmp/anonymous-kubeconfig
+          echo "contexts:">>/tmp/anonymous-kubeconfig
+          echo "- context:">>/tmp/anonymous-kubeconfig
+          echo "    cluster: $NAME">>/tmp/anonymous-kubeconfig
+          echo "    user: $NAME" >>/tmp/anonymous-kubeconfig
+          echo "  name: $NAME" >>/tmp/anonymous-kubeconfig
+          echo "current-context: $NAME" >>/tmp/anonymous-kubeconfig
+          echo "kind: Config">>/tmp/anonymous-kubeconfig
+          echo "preferences: {}">>/tmp/anonymous-kubeconfig
+
+          ### Finding type: Policy:Kubernetes/AdminAccessToDefaultServiceAccount
+
+          cat <<'EOT' >> /tmp/elevate.yaml
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          kind: ClusterRoleBinding
+
+          metadata:
+            name: default-service-acct-admin
+          subjects:
+            - kind: ServiceAccount
+              name: default
+              namespace: default
+          roleRef:
+            kind: ClusterRole
+            name: cluster-admin
+            apiGroup: rbac.authorization.k8s.io
+          EOT
+
+          # /usr/local/bin/kubectl apply -f /tmp/elevate.yaml
+
+          ###  Finding type: PrivilegeEscalation:Kubernetes/PrivilegedContainer
+          ###  Finding type:Kubernetes/ContainerWithSensitiveMount Incident
+
+          cat <<'EOT' >> /tmp/pod_with_sensitive_mount.yaml
+
+          apiVersion: apps/v1
+
+          kind: Deployment
+
+          metadata:
+            name: ubuntu-privileged-with-mount
+          spec:
+            selector:
+              matchLabels:
+                app: ubuntu-privileged-with-mount
+            replicas: 1
+            template:
+              metadata:
+                labels:
+                  app: ubuntu-privileged-with-mount
+              spec:
+                containers:
+                - name: ubuntu-privileged-with-mount
+                  image: nginx
+                  securityContext:
+                    privileged: true
+                  volumeMounts:
+                  - mountPath: /test-pd
+                    name: test-volume
+                volumes:
+                - name: test-volume
+                  hostPath:
+                    path: /etc
+                    type: Directory
+          EOT
+
+          # /usr/local/bin/kubectl apply -f /tmp/pod_with_sensitive_mount.yaml
+
+          ### Finding type: Execution:Kubernetes/ExecInKubeSystemPod
+
+          /usr/local/bin/kubectl run --image=nginx restricted-namespace-pod -n kube-system
+
+          sleep 60
+
+          POD_ID=`/usr/local/bin/kubectl get pod -n kube-system | grep "restricted-namespace-pod" | cut -f1 -d " "`
+
+          /usr/local/bin/kubectl exec -it $POD_ID sh -n kube-system <<'EOT'
+
+          date
+
+          EOT
+
+          ###  Finding type: PrivilegeEscalation:Kubernetes/PrivilegedContainer
+          ###  Finding type:Kubernetes/ContainerWithSensitiveMount Incident
+
+          /usr/local/bin/kubectl apply -f /tmp/pod_with_sensitive_mount.yaml
+
+          ### Finding type: Policy:Kubernetes/AdminAccessToDefaultServiceAccount
+
+          /usr/local/bin/kubectl apply -f /tmp/elevate.yaml
+
+          ### Finding type: Policy:Kubernetes/AnonymousAccessGranted          
+
+          /usr/local/bin/kubectl apply -f /tmp/anonymous.yaml
+
+          # Create Kubernetes/ExposedDashboard
+
+          /usr/local/bin/kubectl apply -f /tmp/k8s-dashboard.yaml
+
+          ### Kubernetes/ExposedDashboard
+
+          /usr/local/bin/kubectl apply -f /tmp/expose_k8s_dashboard.yaml                    
+
+      Tags:
+        - Key: Name
+          Value: DetectiveEKSTeam
+        - Key: ENV
+          Value: TEST
+          
+          
+          
+          
+      
+  EKSEc2Instance:
+    DependsOn:
+      - GatewayAttachment
+      - PublicRoute
+      - EKSDemoKey
+      - EnableGuardDuty
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      IamInstanceProfile: !Ref IAMEC2InstanceRole
+      InstanceType: m4.large
+      ImageId: !Ref LatestAmiId
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref GeneralSecurityGroup
+          SubnetId: !Ref Subnet1
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          export PATH=$PATH:/usr/local/bin
+          sudo yum update -y
+          curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+          curl -o /tmp/kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.20.4/2021-04-12/bin/linux/amd64/kubectl
+          chmod +x /tmp/kubectl
+          sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          alias kubectl='/usr/local/bin/kubectl'
+
+          eksctl create cluster --name GuardDuty-Demo --region us-east-1 --zones us-east-1a,us-east-1b,us-east-1c --with-oidc --ssh-public-key eks-demo-key --managed
+
+          # Wait for EKS deployment
+
+          sleep 6000
+
+          aws eks update-kubeconfig --region us-east-1 --name GuardDuty-Demo
+
+          # Create Kubernetes/ExposedDashboard
+          
+          cat <<'EOT' >> /tmp/k8s-dashboard.yaml
+
+          apiVersion: v1
+
+          kind: Namespace
+
+          metadata:
+            name: kubernetes-dashboard
+
+          ---
+
+
+          apiVersion: v1
+
+          kind: ServiceAccount
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+
+          ---
+
+
+          kind: Service
+
+          apiVersion: v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+          spec:
+            ports:
+              - port: 443
+                targetPort: 8443
+            selector:
+              k8s-app: kubernetes-dashboard
+
+          ---
+
+
+          apiVersion: v1
+
+          kind: Secret
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard-certs
+            namespace: kubernetes-dashboard
+          type: Opaque
+
+
+          ---
+
+
+          apiVersion: v1
+
+          kind: Secret
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard-csrf
+            namespace: kubernetes-dashboard
+          type: Opaque
+
+          data:
+            csrf: ""
+
+          ---
+
+
+          apiVersion: v1
+
+          kind: Secret
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard-key-holder
+            namespace: kubernetes-dashboard
+          type: Opaque
+
+
+          ---
+
+
+          kind: ConfigMap
+
+          apiVersion: v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard-settings
+            namespace: kubernetes-dashboard
+
+          ---
+
+
+          kind: Role
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+          rules:
+            # Allow Dashboard to get, update and delete Dashboard exclusive secrets.
+            - apiGroups: [""]
+              resources: ["secrets"]
+              resourceNames: ["kubernetes-dashboard-key-holder", "kubernetes-dashboard-certs", "kubernetes-dashboard-csrf"]
+              verbs: ["get", "update", "delete"]
+              # Allow Dashboard to get and update 'kubernetes-dashboard-settings' config map.
+            - apiGroups: [""]
+              resources: ["configmaps"]
+              resourceNames: ["kubernetes-dashboard-settings"]
+              verbs: ["get", "update"]
+              # Allow Dashboard to get metrics.
+            - apiGroups: [""]
+              resources: ["services"]
+              resourceNames: ["heapster", "dashboard-metrics-scraper"]
+              verbs: ["proxy"]
+            - apiGroups: [""]
+              resources: ["services/proxy"]
+              resourceNames: ["heapster", "http:heapster:", "https:heapster:", "dashboard-metrics-scraper", "http:dashboard-metrics-scraper"]
+              verbs: ["get"]
+
+          ---
+
+
+          kind: ClusterRole
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+          rules:
+            # Allow Metrics Scraper to get metrics from the Metrics server
+            - apiGroups: ["metrics.k8s.io"]
+              resources: ["pods", "nodes"]
+              verbs: ["get", "list", "watch"]
+
+          ---
+
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          kind: RoleBinding
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: kubernetes-dashboard
+          subjects:
+            - kind: ServiceAccount
+              name: kubernetes-dashboard
+              namespace: kubernetes-dashboard
+
+          ---
+
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          kind: ClusterRoleBinding
+
+          metadata:
+            name: kubernetes-dashboard
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: kubernetes-dashboard
+          subjects:
+            - kind: ServiceAccount
+              name: kubernetes-dashboard
+              namespace: kubernetes-dashboard
+
+          ---
+
+
+          kind: Deployment
+
+          apiVersion: apps/v1
+
+          metadata:
+            labels:
+              k8s-app: kubernetes-dashboard
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+          spec:
+            replicas: 1
+            revisionHistoryLimit: 10
+            selector:
+              matchLabels:
+                k8s-app: kubernetes-dashboard
+            template:
+              metadata:
+                labels:
+                  k8s-app: kubernetes-dashboard
+              spec:
+                containers:
+                  - name: kubernetes-dashboard
+                    image: kubernetesui/dashboard:v2.0.0
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 8443
+                        protocol: TCP
+                    args:
+                      - --enable-skip-login
+                      - --disable-settings-authorizer
+                      - --auto-generate-certificates
+                      - --namespace=kubernetes-dashboard
+                      # Uncomment the following line to manually specify Kubernetes API server Host
+                      # If not specified, Dashboard will attempt to auto discover the API server and connect
+                      # to it. Uncomment only if the default does not work.
+                      # - --apiserver-host=http://my-address:port
+                    volumeMounts:
+                      - name: kubernetes-dashboard-certs
+                        mountPath: /certs
+                        # Create on-disk volume to store exec logs
+                      - mountPath: /tmp
+                        name: tmp-volume
+                    livenessProbe:
+                      httpGet:
+                        scheme: HTTPS
+                        path: /
+                        port: 8443
+                      initialDelaySeconds: 30
+                      timeoutSeconds: 30
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      runAsUser: 1001
+                      runAsGroup: 2001
+                volumes:
+                  - name: kubernetes-dashboard-certs
+                    secret:
+                      secretName: kubernetes-dashboard-certs
+                  - name: tmp-volume
+                    emptyDir: {}
+                serviceAccountName: kubernetes-dashboard
+                nodeSelector:
+                  "kubernetes.io/os": linux
+                # Comment the following tolerations if Dashboard must not be deployed on master
+                tolerations:
+                  - key: node-role.kubernetes.io/master
+                    effect: NoSchedule
+
+          ---
+
+
+          kind: Service
+
+          apiVersion: v1
+
+          metadata:
+            labels:
+              k8s-app: dashboard-metrics-scraper
+            name: dashboard-metrics-scraper
+            namespace: kubernetes-dashboard
+          spec:
+            ports:
+              - port: 8000
+                targetPort: 8000
+            selector:
+              k8s-app: dashboard-metrics-scraper
+
+          ---
+
+
+          kind: Deployment
+
+          apiVersion: apps/v1
+
+          metadata:
+            labels:
+              k8s-app: dashboard-metrics-scraper
+            name: dashboard-metrics-scraper
+            namespace: kubernetes-dashboard
+          spec:
+            replicas: 1
+            revisionHistoryLimit: 10
+            selector:
+              matchLabels:
+                k8s-app: dashboard-metrics-scraper
+            template:
+              metadata:
+                labels:
+                  k8s-app: dashboard-metrics-scraper
+                annotations:
+                  seccomp.security.alpha.kubernetes.io/pod: 'runtime/default'
+              spec:
+                containers:
+                  - name: dashboard-metrics-scraper
+                    image: kubernetesui/metrics-scraper:v1.0.4
+                    ports:
+                      - containerPort: 8000
+                        protocol: TCP
+                    livenessProbe:
+                      httpGet:
+                        scheme: HTTP
+                        path: /
+                        port: 8000
+                      initialDelaySeconds: 30
+                      timeoutSeconds: 30
+                    volumeMounts:
+                    - mountPath: /tmp
+                      name: tmp-volume
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      runAsUser: 1001
+                      runAsGroup: 2001
+                serviceAccountName: kubernetes-dashboard
+                nodeSelector:
+                  "kubernetes.io/os": linux
+                # Comment the following tolerations if Dashboard must not be deployed on master
+                tolerations:
+                  - key: node-role.kubernetes.io/master
+                    effect: NoSchedule
+                volumes:
+                  - name: tmp-volume
+                    emptyDir: {}
+          EOT
+
+          # kubectl apply -f /tmp/k8s-dashboard.yaml
+
+          ### Kubernetes/ExposedDashboard
+
+          cat <<'EOT' >> /tmp/expose_k8s_dashboard.yaml
+
+          apiVersion: v1
+
+          kind: Service
+
+          metadata:
+            name: kubernetes-dashboard-lb
+            namespace: kubernetes-dashboard
+          spec:
+            type: LoadBalancer
+            ports:
+              - port: 443
+                protocol: TCP
+                targetPort: 8443
+            selector:
+              k8s-app: kubernetes-dashboard
+          EOT
+
+          # kubectl apply -f /tmp/expose_k8s_dashboard.yaml
+
+          ### Finding type: Policy:Kubernetes/AnonymousAccessGranted
+
+          cat <<'EOT' >> /tmp/anonymous.yaml
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          kind: ClusterRoleBinding
+
+          metadata:
+            name: anonymous-admin
+          subjects:
+            - kind: User
+              name: system:anonymous
+              namespace: default
+          roleRef:
+            kind: ClusterRole
+            name: view
+            apiGroup: rbac.authorization.k8s.io
+          EOT
+
+          # /usr/local/bin/kubectl apply -f /tmp/anonymous.yaml
+
+          ### Impact:Kubernetes/SuccessfulAnonymousAccess
+          ### Discovery:Kubernetes/SuccessfulAnonymousAccess
+
+          CERT=`cat ~/.kube/config |grep certificate |cut -f2 -d: | sed 's/^//'`
+
+          NAME=`cat ~/.kube/config  | grep "\- name:" |cut -f3 -d" "`
+
+          SERVER=`cat ~/.kube/config |grep "server:" |cut -f6 -d " "`
+
+          touch /tmp/anonymous-kubeconfig
+
+          echo "apiVersion: v1">>/tmp/anonymous-kubeconfig
+          echo "clusters:" >>/tmp/anonymous-kubeconfig
+          echo "- cluster:" >>/tmp/anonymous-kubeconfig
+          echo "    certificate-authority-data: $CERT">>/tmp/anonymous-kubeconfig
+          echo "    server: $SERVER" >>/tmp/anonymous-kubeconfig
+          echo "  name: $NAME" >>/tmp/anonymous-kubeconfig
+          echo "contexts:">>/tmp/anonymous-kubeconfig
+          echo "- context:">>/tmp/anonymous-kubeconfig
+          echo "    cluster: $NAME">>/tmp/anonymous-kubeconfig
+          echo "    user: $NAME" >>/tmp/anonymous-kubeconfig
+          echo "  name: $NAME" >>/tmp/anonymous-kubeconfig
+          echo "current-context: $NAME" >>/tmp/anonymous-kubeconfig
+          echo "kind: Config">>/tmp/anonymous-kubeconfig
+          echo "preferences: {}">>/tmp/anonymous-kubeconfig
+
+          ### Finding type: Policy:Kubernetes/AdminAccessToDefaultServiceAccount
+
+          cat <<'EOT' >> /tmp/elevate.yaml
+
+          apiVersion: rbac.authorization.k8s.io/v1
+
+          kind: ClusterRoleBinding
+
+          metadata:
+            name: default-service-acct-admin
+          subjects:
+            - kind: ServiceAccount
+              name: default
+              namespace: default
+          roleRef:
+            kind: ClusterRole
+            name: cluster-admin
+            apiGroup: rbac.authorization.k8s.io
+          EOT
+
+          # /usr/local/bin/kubectl apply -f /tmp/elevate.yaml
+
+          ###  Finding type: PrivilegeEscalation:Kubernetes/PrivilegedContainer
+          ###  Finding type:Kubernetes/ContainerWithSensitiveMount Incident
+
+          cat <<'EOT' >> /tmp/pod_with_sensitive_mount.yaml
+
+          apiVersion: apps/v1
+
+          kind: Deployment
+
+          metadata:
+            name: ubuntu-privileged-with-mount
+          spec:
+            selector:
+              matchLabels:
+                app: ubuntu-privileged-with-mount
+            replicas: 1
+            template:
+              metadata:
+                labels:
+                  app: ubuntu-privileged-with-mount
+              spec:
+                containers:
+                - name: ubuntu-privileged-with-mount
+                  image: nginx
+                  securityContext:
+                    privileged: true
+                  volumeMounts:
+                  - mountPath: /test-pd
+                    name: test-volume
+                volumes:
+                - name: test-volume
+                  hostPath:
+                    path: /etc
+                    type: Directory
+          EOT
+
+          # /usr/local/bin/kubectl apply -f /tmp/pod_with_sensitive_mount.yaml
+
+          ### Finding type: Execution:Kubernetes/ExecInKubeSystemPod
+
+          /usr/local/bin/kubectl run --image=nginx restricted-namespace-pod -n kube-system
+
+          sleep 60
+
+          POD_ID=`/usr/local/bin/kubectl get pod -n kube-system | grep "restricted-namespace-pod" | cut -f1 -d " "`
+
+          /usr/local/bin/kubectl exec -it $POD_ID sh -n kube-system <<'EOT'
+
+          date
+
+          EOT
+
+          ###  Finding type: PrivilegeEscalation:Kubernetes/PrivilegedContainer
+          ###  Finding type:Kubernetes/ContainerWithSensitiveMount Incident
+
+          /usr/local/bin/kubectl apply -f /tmp/pod_with_sensitive_mount.yaml
+
+          ### Finding type: Policy:Kubernetes/AdminAccessToDefaultServiceAccount
+
+          /usr/local/bin/kubectl apply -f /tmp/elevate.yaml
+
+          ### Finding type: Policy:Kubernetes/AnonymousAccessGranted          
+
+          /usr/local/bin/kubectl apply -f /tmp/anonymous.yaml
+
+          # Create Kubernetes/ExposedDashboard
+
+          /usr/local/bin/kubectl apply -f /tmp/k8s-dashboard.yaml
+
+          ### Kubernetes/ExposedDashboard
+
+          /usr/local/bin/kubectl apply -f /tmp/expose_k8s_dashboard.yaml                    
+
+      Tags:
+        - Key: Name
+          Value: EKSTeam
+        - Key: ENV
+          Value: TEST
+  GuardDutySNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: GDWorkshop-Topic
+  GuardDutySNSTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Id: ID-GD-Topic-Policy
+        Version: 2012-10-17
+        Statement:
+          - Sid: SID-GD-Example
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref GuardDutySNSTopic
+      Topics:
+        - !Ref GuardDutySNSTopic
+  GDLogBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join 
+        - '-'
+        - - guardduty-example-log
+          - !Ref 'AWS::AccountId'
+          - !Ref 'AWS::Region'
+      AccessControl: LogDeliveryWrite
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  ConfigBucket:
+    Type: 'AWS::S3::Bucket'
+  DeliveryChannel:
+    Type: 'AWS::Config::DeliveryChannel'
+    Properties:
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Six_Hours
+      S3BucketName: !Ref ConfigBucket
+  ConfigurationRecorderRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWS_ConfigRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AssumeRole1
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: s3-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${ConfigBucket}/*'
+                Condition:
+                  StringLike:
+                    's3:x-amz-acl': bucket-owner-full-control
+              - Effect: Allow
+                Action: 's3:GetBucketAcl'
+                Resource: !Sub 'arn:aws:s3:::${ConfigBucket}'
+  ConfigurationRecorder:
+    Type: 'AWS::Config::ConfigurationRecorder'
+    Properties:
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+      RoleARN: !GetAtt 
+        - ConfigurationRecorderRole
+        - Arn
+  SecurityHubEnable:
+    DependsOn:
+      - ConfigurationRecorder
+      - EKSDemoKey
+      - EnableGuardDuty
+    Type: 'AWS::SecurityHub::Hub'
+  CustomBackedLambdaToEnableInspectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: lambda-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonInspector2FullAccess
+      Path: /
+  CustomBackedLambdaToEnableInspector:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Lambda to enable Inspectorv2
+      FunctionName: CustomBackedLambdaToEnableInspector
+      Runtime: python3.9
+      Role: !GetAtt 
+        - CustomBackedLambdaToEnableInspectorRole
+        - Arn
+      Handler: index.lambda_handler
+      Timeout: 90
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          client = boto3.client('inspector2')
+
+          def lambda_handler(event, context):
+              if event.get('RequestType') == 'Create':
+                    response = client.enable(
+                      resourceTypes=[
+                          'EC2','ECR','LAMBDA'
+                      ]
+                    )
+                    response['message'] = "TRUE"
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
+              elif event.get('RequestType') == 'Delete':
+                    response = client.disable(
+                      resourceTypes=[
+                          'EC2','ECR','LAMBDA'
+                      ]
+                    )
+                    response['message'] = "FALSE"
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, response)
+  InvokeCustomLambda:
+    Type: Custom::InvokeCustomLambda
+    Properties:
+      ServiceToken: !GetAtt
+        - CustomBackedLambdaToEnableInspector
+        - Arn
+
+
+Outputs:
+  CFNVPCID:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPCID"
+  CFNSUBNET1:
+    Description: Subnet1 ID
+    Value: !Ref Subnet1
+    Export:
+      Name: Subnet1ID

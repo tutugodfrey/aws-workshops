@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to deploy an S3 bucket from AWS Service Catalog
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Enter a name for the bucket. The AWS Region name is appended to the end of the bucket name to increase chances that the name is globally unique.
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${BucketName}-${AWS::Region}
+      PublicAccessBlockConfiguration: #Sets "Block all public access" to "On" for the bucket
+          BlockPublicAcls: True
+          BlockPublicPolicy: True
+          IgnorePublicAcls: True
+          RestrictPublicBuckets: True
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: True
+
+Outputs:
+  BucketName:
+    Description: The name of the S3 bucket that is created.
+    Value: !Ref S3Bucket

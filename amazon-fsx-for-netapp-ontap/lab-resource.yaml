@@ -1,0 +1,326 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Creates the Workshop Studio environment for FSx for NetApp ONTAP
+
+Metadata:
+  Authors:
+    Description: Aaron Dailey (aaronda@amazon.com)
+
+Parameters:
+  MyAssetsBucketName:
+    Description: Assets bucket name
+    Type: String
+  MyAssetsBucketPrefix:
+    Description: Assets bucket prefix
+    Type: String
+  RoleArn:
+    Description: The ARN of the participant IAM role
+    Type: String
+  PrimaryVpcCidr:
+    Description: The private IPv4 CIDR for the Primary VPC.
+    Type: String
+    Default: 10.0.0.0/16
+  DRVpcCidr:
+    Description: The private IPv4 CIDR for the DR VPC ensuring it is differnt than that of the Primary VPC.
+    Type: String
+    Default: 172.31.0.0/16
+  InstanceType:
+    Description: The EC2 instance type deployed. Choose instances(c5n.9xlarge/r5n.9xlarge or higher) with non variable network throughput if running performance benchmarks.
+    Type: String
+    Default: c5n.xlarge
+  ParticipantKeyPair:
+    Type: String
+  LatestWindowsAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base'
+  LatestLinuxAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-x86_64-gp2'
+  MicrosoftADDomain:
+    Description: Domain Name for Microsoft AD
+    Type: String
+    Default: example.com
+  OrganizationalUnitDistinguishedName:
+    Description: OU for the FSx computer object in Active Directory
+    Type: String
+    Default: "OU=Computers,OU=example,DC=example,DC=com"
+  StorageType:
+    Description: Leave default since only SSD supported currently.
+    AllowedValues:
+    - SSD
+    Default: SSD
+    Type: String
+  StorageCapacity:
+    Description: Specify a storage capacity between 1024 to 196608.
+    Type: Number
+    Default: 1024
+  ThroughputCapacity:
+    Description: Select storage throughput from 128, 256, 512, 1024, 2048 or 4096 MB/s.
+    AllowedValues:
+    - 128
+    - 256
+    - 512
+    - 1024
+    - 2048
+    - 4096
+    Default: 128
+    Type: Number
+  RootVolumeSecurityStyle:
+    Description: Security Style of the Root volume. Either in [MIXED, UNIX, NTFS].
+    Type: String
+    Default: UNIX
+    AllowedValues:
+      - UNIX
+      - NTFS
+      - MIXED
+  SecurityStyle:
+    Description: Security style for the volume
+    Type: String
+    Default: UNIX
+    AllowedValues:
+      - UNIX
+      - NTFS
+      - MIXED
+  TieringPolicy:
+    Description: Tiering policy for the volume
+    Type: String
+    Default: AUTO
+    AllowedValues:
+      - SNAPSHOT_ONLY
+      - AUTO
+      - ALL
+      - NONE
+  VolumeSize:
+    Description: Volume Size
+    Type: Number
+    Default: 102400
+  StorageEfficiencyEnabled:
+    Description: Storage Efficiency 
+    Type: String
+    Default: True
+  LowFreeDataStorageCapacityThreshold:
+    ConstraintDescription: Must be an integer.
+    Default: 90
+    Description: Used storage capacity threshold (%)
+    Type: Number
+    MaxValue: 99
+    MinValue: 1
+
+Resources:
+  PrimaryVpc:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        PrimaryAZ0:
+          Fn::Select: 
+            - 0
+            - Fn::GetAZs: !Ref 'AWS::Region'
+        PrimaryAZ1:
+          Fn::Select: 
+            - 1
+            - Fn::GetAZs: !Ref 'AWS::Region'
+        PrimaryVpcCidr: !Ref PrimaryVpcCidr
+      TemplateURL: !Sub "https://${MyAssetsBucketName}.s3.amazonaws.com/${MyAssetsBucketPrefix}01-primary-vpc.yaml"
+  DRVpc:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        DRAZ:
+          Fn::Select: 
+            - 2
+            - Fn::GetAZs: !Ref 'AWS::Region'
+        DRVpcCidr: !Ref DRVpcCidr
+      TemplateURL: !Sub "https://${MyAssetsBucketName}.s3.amazonaws.com/${MyAssetsBucketPrefix}02-dr-vpc.yaml"
+  VpcPeering:
+    DependsOn: [ PrimaryVpc, DRVpc ]
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        PrimaryVpcId:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryVpcId
+        PrimaryPrivateRouteTable0:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateRouteTable0
+        PrimaryPrivateRouteTable1:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateRouteTable1
+        PrimaryPrivateSubnet0Cidr:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateSubnet0Cidr        
+        PrimaryPrivateSubnet1Cidr:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateSubnet1Cidr   
+        DRVpcId:
+          Fn::GetAtt:
+          - DRVpc
+          - Outputs.DRVpcId  
+        DRPrivateRouteTable:
+          Fn::GetAtt:
+          - DRVpc
+          - Outputs.DRPrivateRouteTable  
+        DRPrivateSubnetCidr:
+          Fn::GetAtt:
+          - DRVpc
+          - Outputs.DRPrivateSubnetCidr  
+      TemplateURL: !Sub "https://${MyAssetsBucketName}.s3.amazonaws.com/${MyAssetsBucketPrefix}03-vpc-peering.yaml"
+  Directory:
+    DependsOn: [ PrimaryVpc, DRVpc ]
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+        DomainName: !Ref MicrosoftADDomain
+        PrimaryPrivateSubnetId0:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateSubnetId0
+        PrimaryPrivateSubnetId1:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateSubnetId1
+        PrimaryVpcId:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryVpcId
+        PrimaryDefaultSecurityGroupId:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryDefaultSecurityGroupId
+        DRVpcId:
+          Fn::GetAtt:
+          - DRVpc
+          - Outputs.DRVpcId
+      TemplateURL: !Sub "https://${MyAssetsBucketName}.s3.amazonaws.com/${MyAssetsBucketPrefix}04-directory.yaml"
+  FsxN:
+    DependsOn: [ Directory, VpcPeering ]
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+        DomainName: !Ref MicrosoftADDomain
+        OrganizationalUnitDistinguishedName: !Ref OrganizationalUnitDistinguishedName
+        StorageType: !Ref StorageType
+        StorageCapacity: !Ref StorageCapacity
+        ThroughputCapacity: !Ref ThroughputCapacity
+        RootVolumeSecurityStyle: !Ref RootVolumeSecurityStyle
+        SecurityStyle: !Ref SecurityStyle
+        TieringPolicy: !Ref TieringPolicy
+        VolumeSize: !Ref VolumeSize
+        StorageEfficiencyEnabled: !Ref StorageEfficiencyEnabled
+        LowFreeDataStorageCapacityThreshold: !Ref LowFreeDataStorageCapacityThreshold
+        PrimaryPrivateSubnetId0:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateSubnetId0
+        PrimaryPrivateSubnetId1:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateSubnetId1
+        PrimaryVpcId:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryVpcId
+        PrimaryDefaultSecurityGroupId:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryDefaultSecurityGroupId
+        PrimaryPrivateRouteTable0:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateRouteTable0
+        PrimaryPrivateRouteTable1:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateRouteTable1
+        DRVpcId:
+          Fn::GetAtt:
+          - DRVpc
+          - Outputs.DRVpcId         
+        DRPrivateSubnetId:
+          Fn::GetAtt:
+          - DRVpc
+          - Outputs.DRPrivateSubnetId
+        DRDefaultSecurityGroupId:
+          Fn::GetAtt:
+          - DRVpc
+          - Outputs.DRDefaultSecurityGroupId
+        MSDirectoryDnsIP0:
+          Fn::GetAtt:
+          - Directory
+          - Outputs.MSDirectoryDnsIP0
+        MSDirectoryDnsIP1:
+          Fn::GetAtt:
+          - Directory
+          - Outputs.MSDirectoryDnsIP1
+      TemplateURL: !Sub "https://${MyAssetsBucketName}.s3.amazonaws.com/${MyAssetsBucketPrefix}05-fsx-filesystem.yaml"
+  ClientEnv:
+    DependsOn: [ FsxN ]
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        ParentStackName: !Ref AWS::StackName
+        DomainName: !Ref MicrosoftADDomain
+        LatestWindowsAmiId: !Ref LatestWindowsAmiId
+        LatestLinuxAmiId: !Ref LatestLinuxAmiId
+        InstanceType: !Ref InstanceType
+        KeyPair: !Ref ParticipantKeyPair
+        PrimaryPublicSubnetId0:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPublicSubnetId0
+        PrimaryPublicSubnetId1:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPublicSubnetId1 
+        PrimaryPrivateSubnetId0:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateSubnetId0
+        PrimaryPrivateSubnetId1:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryPrivateSubnetId1
+        PrimaryVpcId:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryVpcId
+        PrimaryDefaultSecurityGroupId:
+          Fn::GetAtt:
+          - PrimaryVpc
+          - Outputs.PrimaryDefaultSecurityGroupId
+        MSDirectoryId:
+          Fn::GetAtt:
+          - Directory
+          - Outputs.MSDirectoryId
+        MSDirectoryDnsIP0:
+          Fn::GetAtt:
+          - Directory
+          - Outputs.MSDirectoryDnsIP0
+        MSDirectoryDnsIP1:
+          Fn::GetAtt:
+          - Directory
+          - Outputs.MSDirectoryDnsIP1
+        PrimaryFileSystemId:
+          Fn::GetAtt:
+          - FsxN
+          - Outputs.PrimaryFileSystemId
+        PrimarySvmId:
+          Fn::GetAtt:
+          - FsxN
+          - Outputs.PrimarySvmId
+        DRFileSystemId:
+          Fn::GetAtt:
+          - FsxN
+          - Outputs.DRFileSystemId
+        DRSvmId:
+          Fn::GetAtt:
+          - FsxN
+          - Outputs.DRSvmId
+      TemplateURL: !Sub "https://${MyAssetsBucketName}.s3.amazonaws.com/${MyAssetsBucketPrefix}06-clients.yaml"

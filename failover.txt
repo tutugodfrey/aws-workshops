@@ -1,0 +1,2 @@
+This test file was transferred from S3 failoverBucket, the secondary origin.
+

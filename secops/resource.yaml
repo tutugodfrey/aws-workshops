@@ -1,0 +1,737 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Template for Security Best Practices - Lab 1 - Controlling the network. Creates 1 VPC, 2 public subnets, 2 private subnets, 1 Internet gateway, 1 NAT gateway, 2 EC2 instances (1 in each private subnet), an application load balancer, and an S3 bucket.'
+
+Parameters:
+  LabVpcCidr:
+    Type: String
+    Default: 10.10.0.0/16
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]).){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(1[6-9]|2[0-8]))$
+
+  LoadBalancerSubnet1Cidr:
+    Type: String
+    Default: 10.10.1.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]).){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(1[6-9]|2[0-8]))$
+
+  LoadBalancerSubnet2Cidr:
+    Type: String
+    Default: 10.10.2.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]).){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(1[6-9]|2[0-8]))$
+
+  WebServerSubnetCidr:
+    Type: String
+    Default: 10.10.10.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]).){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(1[6-9]|2[0-8]))$
+
+  DatabaseServerSubnetCidr:
+    Type: String
+    Default: 10.10.20.0/24
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]).){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(1[6-9]|2[0-8]))$
+
+  WebServerPrivateIp:
+    Type: String
+    Default: 10.10.10.10
+
+  DatabaseServerPrivateIp:
+    Type: String
+    Default: 10.10.20.20
+
+  LatestAL2AmiId: # Locate latest Amazon Linux 2 AMI from public parameter store
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+#-----Start - Create lab networking resources-----#
+  LabVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref LabVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Internet Gateway
+
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVpc
+      InternetGatewayId: !Ref InternetGateway
+
+#-----Load Balancer subnet 1 resources-----#
+  LoadBalancerSubnet1:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachInternetGateway
+    Properties:
+      CidrBlock: !Ref LoadBalancerSubnet1Cidr
+      VpcId: !Ref LabVpc
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Load Balancer Subnet 1 (Public)
+
+#-----Load Balancer subnet 2 resources-----#
+  LoadBalancerSubnet2:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachInternetGateway
+    Properties:
+      CidrBlock: !Ref LoadBalancerSubnet2Cidr
+      VpcId: !Ref LabVpc
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - '1'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Load Balancer Subnet 2 (Public)
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn:
+      - LoadBalancerSubnet1
+      - LoadBalancerSubnet2
+    Properties:
+      VpcId: !Ref LabVpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  LoadBalancerSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PublicRoute
+    Properties:
+      SubnetId: !Ref LoadBalancerSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+
+  LoadBalancerSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PublicRoute
+    Properties:
+      SubnetId: !Ref LoadBalancerSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+#-----Private subnet 1 resources-----#
+  WebServerSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachNatGateway
+    Properties:
+      CidrBlock: !Ref WebServerSubnetCidr
+      VpcId: !Ref LabVpc
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Web Server Subnet (Private)
+
+  NatGateway:
+    DependsOn: LoadBalancerSubnet1RouteTableAssociation
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIpForNatGateway.AllocationId
+      SubnetId: !Ref LoadBalancerSubnet1
+      Tags:
+        - Key: Name
+          Value: NAT Gateway
+
+  AttachNatGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  ElasticIpForNatGateway:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    DependsOn:
+      - WebServerSubnet
+      - DatabaseServerSubnet
+    Properties:
+      VpcId: !Ref LabVpc
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  WebServerSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PrivateRoute
+    Properties:
+      SubnetId: !Ref WebServerSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+#-----Private subnet 2 resources-----#
+  DatabaseServerSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: AttachNatGateway
+    Properties:
+      CidrBlock: !Ref DatabaseServerSubnetCidr
+      VpcId: !Ref LabVpc
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Database Server Subnet (Private)
+
+  DatabaseServerSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: PrivateRoute
+    Properties:
+      SubnetId: !Ref DatabaseServerSubnet
+      RouteTableId: !Ref PrivateRouteTable
+#-----End - Create lab networking resources-----#
+
+#-----Start - create EC2 instance profile to allow the WebServer instance to access required services to build the lab-----#
+  WebServerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: WebServerProfile
+      Roles:
+        - !Ref WebServerIamRole
+
+  WebServerIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: WebServerIamRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore # Allows SSM connections to the instance.
+
+  WebServerBuildPolicy: # Permissions required to build the lab environment
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: WebServerBuildPolicy
+      Roles:
+        - !Ref WebServerIamRole
+      PolicyDocument: # Permissions to modify the SSM connection settings and to delete this policy at the end of the build
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iam:DeleteRolePolicy
+              - s3:GetObject
+              - s3:List*
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - ssm:UpdateDocument*
+              - ssm:CreateDocument*
+              - ssm:DeleteDocument*
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/SSM-SessionManagerRunShell
+#-----End - create EC2 instance profile to allow the WebServer instance to access required services to build the lab-----#
+
+#-----Start - Create security group for WebServer-----#
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: WebServerSG
+      GroupDescription: Network access rules for the Web Server instance
+      VpcId: !Ref LabVpc
+      Tags:
+        - Key: Name
+          Value: Web Server SG
+      SecurityGroupEgress:
+        - IpProtocol: TCP
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+#-----Start - Create Web Server EC2 instance-----#
+  WebServer:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - WebServerSubnetRouteTableAssociation
+      - PasswordGeneratorLambdaFunction
+    Properties:
+      ImageId: !Ref LatestAL2AmiId
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref WebServerProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            DeleteOnTermination: true
+            VolumeType: gp2
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          PrivateIpAddress: !Ref WebServerPrivateIp
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref WebServerSecurityGroup
+          SubnetId: !Ref WebServerSubnet
+      Tags:
+        - Key: Name
+          Value: Web Server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServer --configsets InstallTools,InstallWebServer,EnableTls,InstallWordpress,ConfigureSsm,RemoveBuildPolicy --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServer --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          InstallTools:
+            - "install-tools"
+          InstallWebServer:
+            - "install-web-server"
+          EnableTls:
+            - "enable-tls"
+          InstallWordpress:
+            - "install-wordpress"
+          ConfigureSsm:
+            - "configure-ssm"
+          RemoveBuildPolicy:
+            - "remove-lab-build-policy"
+
+        install-tools:
+          commands:
+            a-update-yum:
+              command: yum update -y
+            b-install-python3:
+              command: yum install -y python3
+            c-remove-aws-cli-v1:
+              command: rm -rf /usr/bin/aws
+            d-download-aws-cli-v2:
+              command: curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            e-unzip-package:
+              command: unzip awscliv2.zip
+            f-install-aws-cli-v2:
+              command: ./aws/install -b
+        install-web-server:  # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-lamp-amazon-linux-2.html
+          commands:
+            a-amazon-linux-extras:
+              command: amazon-linux-extras install -y lamp-mariadb10.2-php7.2 php7.2
+            b-install-apache-mariadb-php:
+              command: yum install -y httpd
+            c-start-apache:
+              command: systemctl start httpd
+            d-start-apache-at-boot:
+              command: systemctl enable httpd
+            e-add-user-to-apache-group:
+              command: usermod -a -G apache ec2-user
+            f-change-www-directory-ownership:
+              command: chown -R ec2-user:apache /var/www
+            g-add-group-write-permissions:
+              command: chmod 2775 /var/www && find /var/www -type d -exec sudo chmod 2775 {} \;
+            h-add-group-permissions-recursively:
+              command: find /var/www -type f -exec sudo chmod 0664 {} \;
+
+        enable-tls: # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/SSL-on-amazon-linux-2.html#ssl_enable
+          commands:
+            a-install-mod-ssl:
+              command: yum install -y mod_ssl
+            b-generate-cert:
+              command: /etc/pki/tls/certs/make-dummy-cert /etc/pki/tls/certs/localhost.crt
+            c-modify-ssl-conf-file:
+              command: sed -i 's/SSLCertificateKeyFile/#SSLCertificateKeyFile/' /etc/httpd/conf.d/ssl.conf
+            d-restart-httpd-service:
+              command: systemctl restart httpd
+
+        install-wordpress: # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hosting-wordpress.html
+          commands:
+            a-download-wordpress:
+              command: wget https://wordpress.org/latest.tar.gz && tar -xzf latest.tar.gz
+            b-create-wp-config-file:
+              command: cp wordpress/wp-config-sample.php wordpress/wp-config.php
+            c-update-wp-config-file:
+              command: !Sub sed -i 's/database_name_here/wordpress_db/; s/username_here/wordpress_user/; s/password_here/${GeneratePassword.RandomString}/; s/'\''DB_HOST'\'', '\''localhost'\''/'\''DB_HOST'\'', '\''${DatabaseServerPrivateIp}'\''/' wordpress/wp-config.php
+            d-copy-wp-files-to-www:
+              command: mkdir /var/www/html/blog && cp -r wordpress/* /var/www/html/blog/
+
+        configure-ssm: # Set Systems Manager Session Manager connection time out 60 minutes, sets the default user for connects to "ec2-user", and changes to the home directory at login.
+          files:
+            /temp/ssm-settings.yaml:
+              content: |
+                inputs:
+                  s3BucketName: ""
+                  s3KeyPrefix: ""
+                  s3EncryptionEnabled: true
+                  cloudWatchLogGroupName: ""
+                  cloudWatchEncryptionEnabled: true
+                  idleSessionTimeout: "60"
+                  cloudWatchStreamingEnabled: true
+                  kmsKeyId: ""
+                  runAsEnabled: true
+                  runAsDefaultUser: ec2-user
+                  shellProfile:
+                    linux: cd $HOME; pwd
+                schemaVersion: "1.0"
+                description: Document to modify Session Manager idle timeout and runas user.
+                sessionType: Standard_Stream
+          commands:
+            a-create-ssm-document:
+              command: aws ssm create-document --name "SSM-SessionManagerRunShell" --content "file:///temp/ssm-settings.yaml" --document-format YAML --document-type Session
+              ignoreErrors: true
+            b-configure-ssm:
+              command: aws ssm update-document --name "SSM-SessionManagerRunShell" --content "file:///temp/ssm-settings.yaml" --document-format YAML --document-version '$LATEST'
+              ignoreErrors: true
+
+        remove-lab-build-policy: # Removes the WebServerBuildPolicy IAM policy from the WebServerIamRole IAM role, as those permissions are needed at build time, but the student should not have access to them.
+          commands:
+            remove-lab-build-policy:
+              command: !Sub aws iam delete-role-policy --role-name ${WebServerIamRole} --policy-name WebServerBuildPolicy
+
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT4M
+#-----End - Create Web Server EC2 instance-----#
+
+#-----Start - create EC2 instance profile to allow the DatabaseServer instance to access required services to build the lab-----#
+  DatabaseServerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: DatabaseServerProfile
+      Roles:
+        - !Ref DatabaseServerIamRole
+
+  DatabaseServerIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DatabaseServerIamRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore # Allows SSM connections to the instance.
+
+  RevokeSecurityGroupRulesPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: RevokeSecurityGroupRulesPolicy
+      Roles:
+        - !Ref DatabaseServerIamRole
+      PolicyDocument: # Permissions to remove security group rules that are no longer needed after the build process
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:RevokeSecurityGroupEgress
+              - ec2:RevokeSecurityGroupIngress
+            Resource: '*'
+#-----End - create EC2 instance profile to allow the DatabaseServer instance to access required services to build the lab-----#
+
+#-----Start - Create security group for DatabaseServer-----#
+  DatabaseServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: DatabaseServerSG
+      GroupDescription: Network access rules for the Database Server instance
+      VpcId: !Ref LabVpc
+      Tags:
+        - Key: Name
+          Value: Database Server SG
+      SecurityGroupEgress:
+        - IpProtocol: TCP
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+#-----End - Create security group for DatabaseServer-----#
+
+#-----Start - Create Database Server EC2 instance-----#
+  DatabaseServer:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DatabaseServerSubnetRouteTableAssociation
+      - WebServer
+      - NetworkLb
+      - PasswordGeneratorLambdaFunction
+    Properties:
+      ImageId: !Ref LatestAL2AmiId
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref DatabaseServerProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            DeleteOnTermination: true
+            VolumeType: gp2
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          PrivateIpAddress: !Ref DatabaseServerPrivateIp
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref DatabaseServerSecurityGroup
+          SubnetId: !Ref DatabaseServerSubnet
+      Tags:
+        - Key: Name
+          Value: Database Server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DatabaseServer --configsets InstallTools,InstallConfigureDb,RemoveEgressRules --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource DatabaseServer --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          InstallTools:
+            - "install-tools"
+          InstallConfigureDb:
+            - "install-and-configure-mariadb"
+          RemoveEgressRules:
+            - "remove-egress-rules"
+
+        install-tools:
+          commands:
+            a-update-yum:
+              command: yum update -y
+            b-install-python3:
+              command: yum install -y python3
+            c-remove-aws-cli-v1:
+              command: rm -rf /usr/bin/aws
+            d-download-aws-cli-v2:
+              command: curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            e-unzip-package:
+              command: unzip awscliv2.zip
+            f-install-aws-cli-v2:
+              command: ./aws/install -b
+
+        install-and-configure-mariadb:
+          commands:
+            a-install-mariadb:
+              command: amazon-linux-extras install -y mariadb10.5
+            b-mariadb-allow-remote-connections:
+              command: sed -i 's/#bind-address/bind-address/' /etc/my.cnf.d/mariadb-server.cnf
+            c-enable-and-start-mariadb-service:
+              command: systemctl enable mariadb && systemctl start mariadb
+            d-set-mariadb-root-password:
+              command: !Sub mysqladmin --user=root password "${GeneratePassword.RandomString}"
+            e-mariadb-drop-anonymous-users1:
+              command: mysql -e "DROP USER IF EXISTS ''@'localhost'"
+            f-mariadb-drop-test-db:
+              command: mysql -e "DROP DATABASE IF EXISTS test"
+            g-mariadb-create-wp-db:
+              command: mysql -e "CREATE DATABASE IF NOT EXISTS wordpress_db"
+            h-mariadb-create-wp-user:
+              command: !Sub mysql -e "CREATE USER IF NOT EXISTS 'wordpress_user'@'${WebServerPrivateIp}' IDENTIFIED BY '${GeneratePassword.RandomString}'"
+            i-mariadb-grant-wp-user-rights:
+              command: !Sub mysql -e "GRANT ALL PRIVILEGES ON wordpress_db.* to 'wordpress_user'@'${WebServerPrivateIp}'"
+            j-mariadb-flush-privileges:
+              command: mysql -e "FLUSH PRIVILEGES"
+
+        remove-egress-rules: # Remove egress rules for ports 80 and 443 from the web and database server security groups. They are needed at build time, but should not be there for the lab.
+          commands:
+            a-remove-web-server-egress-http:
+              command: !Sub aws ec2 revoke-security-group-egress --group-id ${WebServerSecurityGroup.GroupId} --ip-permissions IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0}]
+            b-remove-web-server-egress-https:
+              command: !Sub aws ec2 revoke-security-group-egress --group-id ${WebServerSecurityGroup.GroupId} --ip-permissions IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=0.0.0.0/0}]
+            c-remove-database-server-egress-http:
+              command: !Sub aws ec2 revoke-security-group-egress --group-id ${DatabaseServerSecurityGroup.GroupId} --ip-permissions IpProtocol=tcp,FromPort=80,ToPort=80,IpRanges=[{CidrIp=0.0.0.0/0}]
+
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT3M
+#-----End - Create Database Server EC2 instance-----#
+
+#-----Start - Create network load balancer-----#
+
+#-----network load balancer (Elastic Load Balancer v2)-----#
+  NetworkLb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - LoadBalancerSubnet1RouteTableAssociation
+      - LoadBalancerSubnet2RouteTableAssociation
+    Properties:
+      IpAddressType: ipv4
+      Name: web-lb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref LoadBalancerSubnet1
+        - !Ref LoadBalancerSubnet2
+      Type: network
+
+  NetworkLbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: NetworkLb-WebServer-TargetGroup
+      Protocol: TCP
+      Port: 443
+      TargetType: instance
+      Targets:
+        - Id: !Ref WebServer
+      VpcId: !Ref LabVpc
+
+  NetworkLbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref NetworkLbTargetGroup
+      Protocol: TCP
+      Port: 443
+      LoadBalancerArn: !Ref NetworkLb
+#-----End - Create application load balancer-----#
+
+#-----Start - Create IAM role to allow EC2 to send VPC flow logs to CloudWatch-----#
+  VpcFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: VpcFlowLogsRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service:
+                - vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: VpcFlowLogsPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: '*'
+#-----End - Create IAM role to allow EC2 to send VPC flow logs to CloudWatch-----#
+
+#-----Start - Lambda function to generate random password with given parameters-----#
+  LambdaNumberGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaNumberGeneratorRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: allowLambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:*"
+                Resource: "*"
+
+  PasswordGeneratorLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PasswordGenerator
+      Code:
+        ZipFile: >
+          const response = require("cfn-response");
+
+          const generatePassword = (length, chars) => {
+            var result = '';
+            for (var i = length; i > 0; --i) result += chars[Math.floor(Math.random() * chars.length)];
+            return result;
+          }
+
+          exports.handler = (event, context) =>{
+            const str = generatePassword(event['ResourceProperties']['Length'], '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ');
+            const responseData = {RandomString: str};
+            response.send(event, context, response.SUCCESS, responseData);
+          };
+      Handler: index.handler
+      Runtime: nodejs16.x
+      Role: !GetAtt LambdaNumberGeneratorRole.Arn
+      MemorySize: 128
+      Timeout: 20
+
+  GeneratePassword:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      Length: 20
+      ServiceToken: !GetAtt PasswordGeneratorLambdaFunction.Arn
+#-----End - Lambda function to generate random password with given parameters-----#
+
+#-----Start - Add lab user to ReadOnly group-----#
+Outputs:
+  AwsRegion:
+    Description: AWS Region the lab is running in.
+    Value: !Ref AWS::Region
+
+  WordpressPassword:
+    Value: !GetAtt GeneratePassword.RandomString
+
+  TestSiteUrl:
+    Description: URL to access the web server Apache test page through the application load balancer.
+    Value: !Sub https://${NetworkLb.DNSName}
+
+  WordPressUrl:
+    Description: URL to access the Wordpress page on the web server through the application load balancer.
+    Value: !Sub https://${NetworkLb.DNSName}/blog
+
+  LoadBalancerSubnet1:
+    Description: Subnet CIDR for the first load balancer subnet.
+    Value: !Ref LoadBalancerSubnet1Cidr
+
+  LoadBalancerSubnet2:
+    Description: Subnet CIDR for the second load balancer subnet.
+    Value: !Ref LoadBalancerSubnet2Cidr
+
+  WebServerSubnet:
+    Description: Subnet CIDR for the web server subnet.
+    Value: !Ref WebServerSubnetCidr
+
+  DatabaseServerSubnet:
+    Description: Subnet CIDR for the database server subnet.
+    Value: !Ref DatabaseServerSubnetCidr

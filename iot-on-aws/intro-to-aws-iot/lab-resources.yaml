@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Introduction to AWS Internet of Things (IoT)
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  AmazonLinuxAMIID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: Lab VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+      Tags:
+        - Key: Name
+          Value: Public Subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LabVPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  IoTRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: iot-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - iot.amazonaws.com
+      Policies:
+        - PolicyName: sns-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action: sns:Publish
+                Effect: Allow
+                Resource: "*"
+
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ec2-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+      Policies:
+        - PolicyName: iot-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - iot:CreateKeysAndCertificate
+                  - iot:DescribeEndpoint
+                Effect: Allow
+                Resource: "*"
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+
+  IotDemoSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH Access
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  IotDemoInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /home/ec2-user/simulator/certs/root.pem:
+              source: https://www.amazontrust.com/repository/AmazonRootCA1.pem
+            /home/ec2-user/simulator/device.json:
+              source: https://us-west-2-tcprod.s3.us-west-2.amazonaws.com/courses/ILT-TF-100-PTIOTF/v1.0.8.prod-32b261a0/lab-1/scripts/device.json
+            /home/ec2-user/simulator/package.json:
+              source: https://us-west-2-tcprod.s3.us-west-2.amazonaws.com/courses/ILT-TF-100-PTIOTF/v1.0.8.prod-32b261a0/lab-1/scripts/package.json
+            /home/ec2-user/simulator/simulator.js:
+              source: https://us-west-2-tcprod.s3.us-west-2.amazonaws.com/courses/ILT-TF-100-PTIOTF/v1.0.8.prod-32b261a0/lab-1/scripts/simulator.js
+          commands:
+            1-Add-NodeJS:
+              command: curl --silent --location https://rpm.nodesource.com/setup_12.x | bash -
+              waitAfterCompletion: 0
+            2-Update-Yum-Packages:
+              command: yum -y update
+              waitAfterCompletion: 0
+            3-Install-Yum-Packages:
+              command: yum -y install nodejs
+              waitAfterCompletion: 0
+            4-Get-Endpoint:
+              command: !Sub sed -i "s/<IOT_ENDPOINT>/$(aws iot describe-endpoint --endpoint-type iot:Data-ATS --region ${AWS::Region} --query endpointAddress --output text)/" /home/ec2-user/simulator/device.json
+              waitAfterCompletion: 0
+            5-Change-Ownership:
+              command: chown --recursive ec2-user /home/ec2-user/simulator/
+              waitAfterCompletion: 0
+            6-Set-AWS-Region:
+              command: !Sub sudo -u ec2-user aws configure set region ${AWS::Region}
+              waitAfterCompletion: 0
+    Properties:
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      ImageId: !Ref AmazonLinuxAMIID
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !GetAtt IotDemoSecurityGroup.GroupId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: IotDemoInstance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} --resource IotDemoInstance
+          /opt/aws/bin/cfn-signal --stack ${AWS::StackName} --region ${AWS::Region} --resource IotDemoInstance --exit-code $?
+
+  IoTThingPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: ThermostatPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - iot:Connect
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${!iot:Connection.Thing.ThingName}
+          - Action:
+              - iot:Publish
+              - iot:Receive
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/house
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/${!iot:Connection.Thing.ThingName}/shadow/*
+          - Action:
+              - iot:Subscribe
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/house
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/${!iot:Connection.Thing.ThingName}/shadow/*
+
+Outputs:
+  IotIpAddress:
+    Description: Public IP address of the IoT Instance
+    Value: !GetAtt IotDemoInstance.PublicIp
+
+  LabRegion:
+    Value: !Ref AWS::Region

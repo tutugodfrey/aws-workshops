@@ -1,0 +1,389 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Master template to create the Migrate and Modernize at scale with One Factory re:Invent ENT 315 workshop. Also, you are
+  solely responsible for complying with the license terms for the software
+  downloaded and installed by this template. By creating a stack from this
+Parameters:
+  DomainName:
+    Description: >-
+      The fully qualified name for the source VPC, such as onpremsim.env. The
+      name doesn't need to be publicly resolvable; it will resolve inside your
+      VPC only.
+    Type: String
+    MinLength: '5'
+    MaxLength: '16'
+    Default: onpremsim.env
+  AdminPassword:
+    Description: The password for the Bastion Administrator
+    Default: 't9Dz8W#k'
+    NoEcho: 'true'
+    Type: String
+    MinLength: '8'
+    MaxLength: '18'
+    AllowedPattern: '^(?=[a-zA-Z0-9#@$?]{8,}$)(?=.*?[a-z])(?=.*?[A-Z])(?=.*?[0-9]).*'
+    ConstraintDescription: must contain alphanumeric+special characters.
+  RootPassword:
+    Default: AWSmid2022
+    NoEcho: 'true'
+    Description: >-
+      SSH password for user 'user'. This user has sudo power. Use an
+      alphanumeric password
+    Type: String
+    MinLength: '8'
+    MaxLength: '12'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: must contain only alphanumeric characters.
+  SourceS3Bucket:
+    Description: S3 Bucket with CFN stack files
+    Type: String
+    Default: reinvent2022-factory-us-east-1
+  SourceS3Path:
+    Description: S3 Path with CFN stack files
+    Type: String
+    Default: workshop/v3/cemf/v3.0.0
+  EC2ModelBastion:
+    Description: Model of EC2 Servers in the source environment - Windows Bastion
+    Type: String
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Default: t3.medium
+  EC2ModelLinux:
+    Description: Model of EC2 Servers in the source environment - Linux
+    Type: String
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Default: t3.small
+  EC2ModelWindows:
+    Description: Model of EC2 Servers in the source environment - Windows
+    Type: String
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Default: t3.small
+  SourceCidrForRDP:
+    Description: >-
+      IP Cidr from which you are likely to RDP into the instances. You can add
+      rules later by modifying the created security groups e.g. 54.32.98.160/32
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '^([0-9]+\.){3}[0-9]+\/[0-9]+$'
+  LaunchBastion:
+    Description: Launch Bastion Server
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+  LaunchWindows:
+    Description: Launch Windows SVR
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+  LaunchFactory:
+    Description: Launch Migration Factory
+    Default: 'TRUE'
+    Type: String
+    AllowedValues:
+      - 'TRUE'
+      - 'FALSE'
+  Application:
+    Type: String
+    Description: Application name is used to name all AWS resources.
+    Default: migration-factory
+    AllowedPattern: "[-a-z0-9]*"
+    ConstraintDescription: Application parameter must be all lower case characters
+  Environment:
+    Type: String
+    Description: Environment name is used to name all AWS resources (.i.e dev, test, prod)
+    Default: lab
+    AllowedPattern: "[-a-z0-9]*"
+    ConstraintDescription: Application parameter must be all lower case characters
+Conditions:
+  CreateBastion: !Equals
+    - !Ref LaunchBastion
+    - 'TRUE'
+  CreateWindows: !Equals
+    - !Ref LaunchWindows
+    - 'TRUE'
+  CreateFactory: !Equals
+    - !Ref LaunchFactory
+    - 'TRUE'
+Resources:
+  SOURCENETWORK:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Sub
+      - https://s3.amazonaws.com/${SourceS3Bucket}/${path}/static/env/SOURCE_NETWORK.yml
+      - path: !Select [0, !Split ["/", !Ref SourceS3Path]]
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+      Parameters:
+        DomainName: !Ref DomainName
+  SOURCEBASTION:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: CreateBastion
+    Properties:
+      TemplateURL: !Sub
+      - https://s3.amazonaws.com/${SourceS3Bucket}/${path}/static/env/SOURCE_BASTION.yml
+      - path: !Select [0, !Split ["/", !Ref SourceS3Path]]
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+      Parameters:
+        AdminPassword: !Ref AdminPassword
+        bastionSize: !Ref EC2ModelBastion
+        InstanceProfile: !GetAtt
+          - FACTORY
+          - Outputs.AutomationServerInstanceProfile
+        VPCCloud: !GetAtt
+          - SOURCENETWORK
+          - Outputs.VPCSource
+        SubnetCloudPublic: !GetAtt
+          - SOURCENETWORK
+          - Outputs.SubnetSourcePublic
+        TargetVPCId: !GetAtt
+          - SOURCENETWORK
+          - Outputs.VPCTarget
+        SubnetTargetPrivate: !GetAtt
+          - SOURCENETWORK
+          - Outputs.SubnetTargetPrivate
+        TargetSecurityGroup: !GetAtt
+          - SOURCENETWORK
+          - Outputs.TargetSecurityGroup
+        SourceCidrForRDP: !Ref SourceCidrForRDP
+  WebServerSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !GetAtt
+        - SOURCENETWORK
+        - Outputs.VPCSource
+      GroupDescription: Enable HTTP access via port 80 locked down to the load balancer + SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 8081
+          ToPort: 8081
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 192.168.0.0/16
+  DatabaseSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !GetAtt
+        - SOURCENETWORK
+        - Outputs.VPCSource
+      GroupDescription: Enable mariadb access via port 3306 locked down to the load balancer + SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 1433
+          ToPort: 1433
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 192.168.0.0/16
+        - IpProtocol: icmp
+          FromPort: 8
+          ToPort: -1
+          CidrIp: 192.168.0.0/16
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - Ref: EC2InstanceRole
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  TARGETACCT:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: CreateFactory
+    Properties:
+      TemplateURL: !Sub
+      - https://s3.amazonaws.com/${SourceS3Bucket}/${path}/static/env/aws-cloud-migration-factory-solution-target-account.template
+      - path: !Select [0, !Split ["/", !Ref SourceS3Path]]
+      Tags:
+        - Key: Env
+          Value: MID-MGN-Config
+        - Key: Stack
+          Value: TargetAccountConfig
+      Parameters:
+        FactoryAWSAccountId: !Ref AWS::AccountId
+  FACTORY:
+    Type: 'AWS::CloudFormation::Stack'
+    Condition: CreateFactory
+    Properties:
+      TemplateURL: !Sub
+      - https://s3.amazonaws.com/${SourceS3Bucket}/${path}/static/env/aws-cloud-migration-factory-solution.template
+      - path: !Select [0, !Split ["/", !Ref SourceS3Path]]
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: FACTORY
+      Parameters:
+        Application: !Ref Application
+        Environment: !Ref Environment
+        SourceCIDR: ''
+        SourceS3Bucket: !Ref SourceS3Bucket
+        SourceS3Path: !Sub
+        - "${path}/static/env"
+        - path: !Select [0, !Split ["/", !Ref SourceS3Path]]
+  SOURCEWORDPRESS:
+    Type: 'AWS::CloudFormation::Stack'
+    DependsOn: [SOURCEBASTION]
+    Properties:
+      TemplateURL: !Sub
+      - https://s3.amazonaws.com/${SourceS3Bucket}/${path}/static/env/SOURCE_WORDPRESS.yml
+      - path: !Select [0, !Split ["/", !Ref SourceS3Path]]
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+      Parameters:
+        DomainName: !Ref DomainName
+        OnPremSimVPC: !GetAtt
+          - SOURCENETWORK
+          - Outputs.VPCSource
+        OnPremSimSubnet1: !GetAtt
+          - SOURCENETWORK
+          - Outputs.SubnetSourcePrivate
+        WEBInstanceType: !Ref EC2ModelLinux
+        DBPassword: !Ref RootPassword
+        RootPassword: !Ref RootPassword
+        SourceInstanceProfile: !Ref EC2InstanceProfile
+  SOURCEOFBIZ:
+    Type: 'AWS::CloudFormation::Stack'
+    DependsOn: [SOURCEBASTION]
+    Properties:
+      TemplateURL: !Sub
+      - https://s3.amazonaws.com/${SourceS3Bucket}/${path}/static/env/SOURCE_OFBiz.yml
+      - path: !Select [0, !Split ["/", !Ref SourceS3Path]]
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+      Parameters:
+        DomainName: !Ref DomainName
+        OnPremSimVPC: !GetAtt
+          - SOURCENETWORK
+          - Outputs.VPCSource
+        OnPremSimSubnet1: !GetAtt
+          - SOURCENETWORK
+          - Outputs.SubnetSourcePrivate
+        SourceInstanceProfile: !Ref EC2InstanceProfile
+        RootPassword: !Ref RootPassword
+  SOURCEWINDOWS:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Sub
+      - https://s3.amazonaws.com/${SourceS3Bucket}/${path}/static/env/SOURCE_WINDOWS.yml
+      - path: !Select [0, !Split ["/", !Ref SourceS3Path]]
+      Tags:
+        - Key: Env
+          Value: MID-SOURCE
+        - Key: Stack
+          Value: SOURCENETWORK
+      Parameters:
+        OnPremSimVPC: !GetAtt
+          - SOURCENETWORK
+          - Outputs.VPCSource
+        OnPremSimSubnet1: !GetAtt
+          - SOURCENETWORK
+          - Outputs.SubnetSourcePrivate
+        opWindowsSize: !Ref EC2ModelWindows
+        AdminPassword: !Ref RootPassword
+        SourceInstanceProfile: !Ref EC2InstanceProfile
+Outputs:
+  AWSAccountId:
+    Value: !Ref AWS::AccountId
+  BastionHostIP:
+    Value: !GetAtt
+      - SOURCEBASTION
+      - Outputs.BastionRDP
+  BastionHostUserName:
+    Value: "administrator"
+  BastionHostPassword:
+    Value: !Ref AdminPassword
+  SubnetTargetPrivate:
+    Value: !GetAtt
+      - SOURCENETWORK
+      - Outputs.SubnetTargetPrivate
+  TargetSecurityGroup:
+    Value: !GetAtt
+      - SOURCENETWORK
+      - Outputs.TargetSecurityGroup
+  VPCTarget:
+    Value: !GetAtt
+      - SOURCENETWORK
+      - Outputs.VPCTarget
+  MigrationFactoryURL:
+    Condition: CreateFactory
+    Value: !GetAtt
+      - FACTORY
+      - Outputs.MigrationFactoryURL
+  FactoryUserName:
+    Condition: CreateFactory
+    Value: !GetAtt
+      - FACTORY
+      - Outputs.FactoryUserName
+  FactoryPassword:
+    Condition: CreateFactory
+    Value: !GetAtt
+      - FACTORY
+      - Outputs.FactoryPassword

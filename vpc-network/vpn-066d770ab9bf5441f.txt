@@ -1,0 +1,417 @@
+! Amazon Web Services
+! Virtual Private Cloud
+
+! AWS utilizes unique identifiers to manipulate the configuration of
+! a VPN Connection. Each VPN Connection is assigned an identifier and is
+! associated with two other identifiers, namely the
+! Customer Gateway Identifier and Virtual Private Gateway Identifier.
+!
+! Your VPN Connection ID 		              : vpn-066d770ab9bf5441f
+! Your Virtual Private Gateway ID         : 
+! Your Customer Gateway ID		            : cgw-07a7b0d285d0af104
+!
+!
+! This configuration consists of two tunnels. Both tunnels must be
+! configured on your Customer Gateway.
+!
+! --------------------------------------------------------------------------------
+! IPSec Tunnel #1
+! --------------------------------------------------------------------------------
+! #1: Internet Key Exchange (IKE) Configuration
+!
+! A policy is established for the supported ISAKMP encryption,
+! authentication, Diffie-Hellman, lifetime, and key parameters.
+! Please note, these sample configurations are for the minimum requirement of AES128, SHA1, and DH Group 2.
+! Category "VPN" connections in the GovCloud region have a minimum requirement of AES128, SHA2, and DH Group 14.
+! You will need to modify these sample configuration files to take advantage of AES256, SHA256, or other DH groups like 2, 14-18, 22, 23, and 24.
+! NOTE: If you customized tunnel options when creating or modifying your VPN connection, you may need to modify these sample configurations to match the custom settings for your tunnels.
+!
+! Higher parameters are only available for VPNs of category "VPN," and not for "VPN-Classic".
+!
+! The address of the external interface for your customer gateway must be a static address.
+! Your customer gateway may reside behind a device performing network address translation (NAT).
+! To ensure that NAT traversal (NAT-T) can function, you must adjust your firewall rules to unblock UDP port 4500.
+! If not behind NAT, and you are not using an Accelerated VPN, we recommend disabling NAT-T. If you are using an Accelerated VPN, make sure that NAT-T is enabled.
+!
+! Configuration begins in root VDOM.
+
+config vpn ipsec phase1-interface
+edit vpn-066d770ab9bf5441f-0 ! Name must be shorter than 15 chars, best if shorter than 12
+  set interface "wan1"
+
+! The IPSec Dead Peer Detection causes periodic messages to be
+! sent to ensure a Security Association remains operational
+
+  set dpd enable
+  set local-gw 3.238.76.222
+  set dhgrp 2
+  set proposal aes128-sha1
+  set keylife 28800
+  set remote-gw 34.196.28.183
+  set psksecret t6HIymL1bbEASDBvqvzCotdys71Wfrlf
+  set dpd-retryinterval 10
+ next
+end
+
+
+! #2: IPSec Configuration
+!
+! The IPSec transform set defines the encryption, authentication, and IPSec
+! mode parameters.
+!
+! Category "VPN" connections in the GovCloud region have a minimum requirement of AES128, SHA2, and DH Group 14.
+! Please note, you may use these additionally supported IPSec parameters for encryption like AES256 and other DH groups like 2, 5, 14-18, 22, 23, and 24.
+! Higher parameters are only available for VPNs of category "VPN," and not for "VPN-Classic".
+
+config vpn ipsec phase2-interface
+ edit "vpn-066d770ab9bf5441f-0"
+  set phase1name "vpn-066d770ab9bf5441f-0"
+  set proposal aes128-sha1
+  set dhgrp 2
+  set pfs enable
+  set keylifeseconds 3600
+ next
+
+! --------------------------------------------------------------------------------
+! #3: Tunnel Interface Configuration
+!
+! A tunnel interface is configured to be the logical interface associated
+! with the tunnel. All traffic routed to the tunnel interface will be
+! encrypted and transmitted to the VPC. Similarly, traffic from the VPC
+! will be logically received on this interface.
+!
+!
+! The address of the interface is configured with the setup for your
+! Customer Gateway.  If the address changes, the Customer Gateway and VPN
+! Connection must be recreated with Amazon VPC.
+! Perform this from the Global VDOM.
+
+config global
+config system interface
+ edit "vpn-066d770ab9bf5441f-0"
+  set vdom "root"
+  set ip 169.254.80.126 255.255.255.255
+  set allowaccess ping
+  set type tunnel
+
+!  This option causes the router to reduce the Maximum Segment Size of
+!  TCP packets to prevent packet fragmentation.
+!
+  set tcp-mss 1379
+  set remote-ip 169.254.80.125
+  set mtu 1427
+  set interface "wan1"
+ next
+
+
+! -------------------------------------------------------------------------------------------
+! #4: Border Gateway Protocol (BGP) Configuration
+!
+! BGP is used within the tunnel to exchange prefixes between the
+! Virtual Private Gateway and your Customer Gateway. The Virtual Private Gateway
+! will announce the prefix corresponding to your VPC.
+!
+!
+! The local BGP Autonomous System Number (ASN) (65000)
+! is configured as part of your Customer Gateway. If the ASN must
+! be changed, the Customer Gateway and VPN Connection will need to be recreated with AWS.
+! Configuration begins in root VDOM.
+
+config vdom
+    edit root
+      config router bgp
+        set as 65000
+      config neighbor
+        edit 169.254.80.125
+        set remote-as 64512
+end
+
+! Your Customer Gateway may announce a default route (0.0.0.0/0) to us.
+! This is done using prefix list and route-map in Fortigate.
+
+config router bgp
+ config neighbor
+  edit 169.254.80.125
+   set capability-default-originate enable
+   end
+ end
+
+config router prefix-list
+ edit "default_route"
+  config rule
+   edit 1
+    set prefix 0.0.0.0 0.0.0.0
+   next
+  end
+ set router-id 3.238.76.222
+end
+
+config router route-map
+ edit "routemap1"
+  config rule
+   edit 1
+    set match-ip-address "default_route"
+   next
+  end
+ next
+end
+
+! To advertise additional prefixes to Amazon VPC, add these prefixes to the 'network'
+! statement and identify the prefix you wish to advertise. Make sure the prefix is present
+! in the routing table of the device with a valid next-hop. If you want to advertise
+! 192.168.0.0/16 to Amazon, this can be done using the following:
+
+config router bgp
+config network
+ edit 1
+  set prefix 192.168.0.0 255.255.0.0
+ next
+end
+set router-id 3.238.76.222
+end
+
+! --------------------------------------------------------------------------------
+! #5 Firewall Policy Configuration
+!
+! Create a firewall policy permitting traffic from your local subnet to the VPC subnet and vice versa
+!
+! This example policy permits all traffic from the local subnet to the VPC
+! First, find the policies that exist
+! Configuration begins in root VDOM.
+
+config vdom
+    edit root
+      show firewall policy
+
+! Next, create a new firewall policy starting with the next available policy ID. If policies 1, 2, 3, and 4 were shown, then in this example the policy created starts 5
+
+config firewall policy
+edit 5
+set srcintf "vpn-066d770ab9bf5441f-0"
+set dstintf internal
+ set srcaddr all
+ set dstaddr all
+set action accept
+set schedule always
+ set service ALL
+next
+end
+
+! Now create a policy to permit traffic going the other way
+
+config firewall policy
+edit 6
+set srcintf internal
+set dstintf "vpn-066d770ab9bf5441f-0"
+ set srcaddr all
+ set dstaddr all
+set action accept
+set schedule always
+ set service ALL
+next
+end
+
+! --------------------------------------------------------------------------------
+! IPSec Tunnel #2
+! --------------------------------------------------------------------------------
+! #1: Internet Key Exchange (IKE) Configuration
+!
+! A policy is established for the supported ISAKMP encryption,
+! authentication, Diffie-Hellman, lifetime, and key parameters.
+! Please note, these sample configurations are for the minimum requirement of AES128, SHA1, and DH Group 2.
+! Category "VPN" connections in the GovCloud region have a minimum requirement of AES128, SHA2, and DH Group 14.
+! You will need to modify these sample configuration files to take advantage of AES256, SHA256, or other DH groups like 2, 14-18, 22, 23, and 24.
+! NOTE: If you customized tunnel options when creating or modifying your VPN connection, you may need to modify these sample configurations to match the custom settings for your tunnels.
+!
+! Higher parameters are only available for VPNs of category "VPN," and not for "VPN-Classic".
+!
+! The address of the external interface for your customer gateway must be a static address.
+! Your customer gateway may reside behind a device performing network address translation (NAT).
+! To ensure that NAT traversal (NAT-T) can function, you must adjust your firewall rules to unblock UDP port 4500.
+! If not behind NAT, and you are not using an Accelerated VPN, we recommend disabling NAT-T. If you are using an Accelerated VPN, make sure that NAT-T is enabled.
+!
+! Configuration begins in root VDOM.
+
+config vpn ipsec phase1-interface
+edit vpn-066d770ab9bf5441f-1 ! Name must be shorter than 15 chars, best if shorter than 12
+  set interface "wan1"
+
+! The IPSec Dead Peer Detection causes periodic messages to be
+! sent to ensure a Security Association remains operational
+
+  set dpd enable
+  set local-gw 3.238.76.222
+  set dhgrp 2
+  set proposal aes128-sha1
+  set keylife 28800
+  set remote-gw 44.208.144.221
+  set psksecret ILnG6zkLCaKjz3CjgdU2m5BSG2PaYQQk
+  set dpd-retryinterval 10
+ next
+end
+
+
+! #2: IPSec Configuration
+!
+! The IPSec transform set defines the encryption, authentication, and IPSec
+! mode parameters.
+!
+! Category "VPN" connections in the GovCloud region have a minimum requirement of AES128, SHA2, and DH Group 14.
+! Please note, you may use these additionally supported IPSec parameters for encryption like AES256 and other DH groups like 2, 5, 14-18, 22, 23, and 24.
+! Higher parameters are only available for VPNs of category "VPN," and not for "VPN-Classic".
+
+config vpn ipsec phase2-interface
+ edit "vpn-066d770ab9bf5441f-1"
+  set phase1name "vpn-066d770ab9bf5441f-1"
+  set proposal aes128-sha1
+  set dhgrp 2
+  set pfs enable
+  set keylifeseconds 3600
+ next
+
+! --------------------------------------------------------------------------------
+! #3: Tunnel Interface Configuration
+!
+! A tunnel interface is configured to be the logical interface associated
+! with the tunnel. All traffic routed to the tunnel interface will be
+! encrypted and transmitted to the VPC. Similarly, traffic from the VPC
+! will be logically received on this interface.
+!
+!
+! The address of the interface is configured with the setup for your
+! Customer Gateway.  If the address changes, the Customer Gateway and VPN
+! Connection must be recreated with Amazon VPC.
+! Perform this from the Global VDOM.
+
+config global
+config system interface
+ edit "vpn-066d770ab9bf5441f-1"
+  set vdom "root"
+  set ip 169.254.200.2 255.255.255.255
+  set allowaccess ping
+  set type tunnel
+
+!  This option causes the router to reduce the Maximum Segment Size of
+!  TCP packets to prevent packet fragmentation.
+!
+  set tcp-mss 1379
+  set remote-ip 169.254.200.1
+  set mtu 1427
+  set interface "wan1"
+ next
+
+
+! -------------------------------------------------------------------------------------------
+! #4: Border Gateway Protocol (BGP) Configuration
+!
+! BGP is used within the tunnel to exchange prefixes between the
+! Virtual Private Gateway and your Customer Gateway. The Virtual Private Gateway
+! will announce the prefix corresponding to your VPC.
+!
+!
+! The local BGP Autonomous System Number (ASN) (65000)
+! is configured as part of your Customer Gateway. If the ASN must
+! be changed, the Customer Gateway and VPN Connection will need to be recreated with AWS.
+! Configuration begins in root VDOM.
+
+config vdom
+    edit root
+      config router bgp
+        set as 65000
+      config neighbor
+        edit 169.254.200.1
+        set remote-as 64512
+end
+
+! Your Customer Gateway may announce a default route (0.0.0.0/0) to us.
+! This is done using prefix list and route-map in Fortigate.
+
+config router bgp
+ config neighbor
+  edit 169.254.200.1
+   set capability-default-originate enable
+   end
+ end
+
+config router prefix-list
+ edit "default_route"
+  config rule
+   edit 1
+    set prefix 0.0.0.0 0.0.0.0
+   next
+  end
+ set router-id 3.238.76.222
+end
+
+config router route-map
+ edit "routemap1"
+  config rule
+   edit 1
+    set match-ip-address "default_route"
+   next
+  end
+ next
+end
+
+! To advertise additional prefixes to Amazon VPC, add these prefixes to the 'network'
+! statement and identify the prefix you wish to advertise. Make sure the prefix is present
+! in the routing table of the device with a valid next-hop. If you want to advertise
+! 192.168.0.0/16 to Amazon, this can be done using the following:
+
+config router bgp
+config network
+ edit 1
+  set prefix 192.168.0.0 255.255.0.0
+ next
+end
+set router-id 3.238.76.222
+end
+
+! --------------------------------------------------------------------------------
+! #5 Firewall Policy Configuration
+!
+! Create a firewall policy permitting traffic from your local subnet to the VPC subnet and vice versa
+!
+! This example policy permits all traffic from the local subnet to the VPC
+! First, find the policies that exist
+! Configuration begins in root VDOM.
+
+config vdom
+    edit root
+      show firewall policy
+
+! Next, create a new firewall policy starting with the next available policy ID. If policies 1, 2, 3, and 4 were shown, then in this example the policy created starts 5
+
+config firewall policy
+edit 5
+set srcintf "vpn-066d770ab9bf5441f-1"
+set dstintf internal
+ set srcaddr all
+ set dstaddr all
+set action accept
+set schedule always
+ set service ALL
+next
+end
+
+! Now create a policy to permit traffic going the other way
+
+config firewall policy
+edit 6
+set srcintf internal
+set dstintf "vpn-066d770ab9bf5441f-1"
+ set srcaddr all
+ set dstaddr all
+set action accept
+set schedule always
+ set service ALL
+next
+end
+
+
+
+! Additional Notes and Questions
+!  - Amazon Virtual Private Cloud Getting Started Guide:
+!       http://docs.amazonwebservices.com/AmazonVPC/latest/GettingStartedGuide
+!  - Amazon Virtual Private Cloud Network Administrator Guide:
+!       http://docs.amazonwebservices.com/AmazonVPC/latest/NetworkAdminGuide

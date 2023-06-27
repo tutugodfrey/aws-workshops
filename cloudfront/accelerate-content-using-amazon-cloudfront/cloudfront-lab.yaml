@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFront Workshop (https://content-acceleration-cloudfront.workshop.aws)
+
+
+
+Parameters:
+  imageId:
+    Description: Linux AMI image
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    AllowedValues:
+      - /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+      - /aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-x86_64-gp2
+      - /aws/service/ami-amazon-linux-latest/al2022-ami-kernel-5.10-x86_64
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+  myIPAddress:
+    Type: String
+    Description: My IP address. Get it from https://checkip.amazonaws.com and append /32, xx.xx.xx.xx/32. Use 0.0.0.0/0 if unsure
+    ConstraintDescription: Do enter a IP prefix. Use 0.0.0.0/0 if unsure
+    AllowedPattern: "[\\d\\.\\/]+"
+
+Mappings:
+  # aws ec2 describe-managed-prefix-lists --query 'PrefixLists[?PrefixListName==`com.amazonaws.global.cloudfront.origin-facing`]' --region <REGION>
+  AWSRegions2PrefixListID:
+    ap-northeast-1:
+      PrefixList: pl-58a04531
+    ap-northeast-2:
+      PrefixList: pl-22a6434b
+    ap-northeast-3:
+      PrefixList: pl-31a14458
+    ap-south-1:
+      PrefixList: pl-9aa247f3
+    ap-southeast-1:
+      PrefixList: pl-31a34658
+    ap-southeast-2:
+      PrefixList: pl-b8a742d1
+    #ap-southeast-3:
+    #  PrefixList: 
+    ca-central-1:
+      PrefixList: pl-38a64351
+    eu-central-1:
+      PrefixList: pl-a3a144ca
+    eu-north-1:
+      PrefixList: pl-fab65393
+    eu-west-1:
+      PrefixList: pl-4fa04526
+    eu-west-2:
+      PrefixList: pl-93a247fa
+    eu-west-3:
+      PrefixList: pl-75b1541c
+    sa-east-1:
+      PrefixList: pl-5da64334
+    us-east-1:
+      PrefixList: pl-3b927c52
+    us-east-2:
+      PrefixList: pl-b6a144df
+    us-west-1:
+      PrefixList: pl-4ea04527
+    us-west-2:
+      PrefixList: pl-82a045eb
+
+
+Resources:
+  securityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudFront Workshop     
+      SecurityGroupIngress:
+        - Description: Allow HTTP
+          IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          SourcePrefixListId:  !FindInMap [AWSRegions2PrefixListID, !Ref 'AWS::Region', PrefixList]
+        - Description: Allow HTTP from my IP address for testing
+          IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: !Ref myIPAddress
+      Tags:
+        - Key: Name
+          Value: CloudFront Workshop
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+        - Key: StackId
+          Value: !Sub ${AWS::StackId}
+
+  instanceIamRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: CloudFront Workshop
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+        - Key: StackId
+          Value: !Sub ${AWS::StackId}
+
+  instanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: /
+      Roles: 
+      - !Ref instanceIamRole
+
+  instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    Metadata:
+      Comment: Install    
+      AWS::CloudFormation::Init:    
+        configSets:
+          InstallFiles:
+          - "setup-1"
+        setup-1:
+          packages:
+            yum:
+              tmux: []      
+    Properties:
+      ImageId: !Ref imageId
+      InstanceType: t2.micro
+      SecurityGroups:
+        - !Ref securityGroup
+      IamInstanceProfile: !Ref instanceProfile
+      Tags:
+        - Key: Name
+          Value: CloudFront Workshop
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+        - Key: StackId
+          Value: !Sub ${AWS::StackId}
+          
+      UserData: 
+        Fn::Base64: 
+          !Sub |           
+            #!/bin/bash
+
+            # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-helper-scripts-reference.html
+            yum install -y aws-cfn-bootstrap
+            
+            # cfn-init
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource instance --region ${AWS::Region} -c InstallFiles
+
+            yum update -y
+            curl -sL https://rpm.nodesource.com/setup_14.x | sudo bash -
+            yum install -y nodejs
+            
+            # https://www.digitalocean.com/community/tutorials/how-to-set-up-a-node-js-application-for-production-on-centos-7
+            npm install pm2@latest -g
+
+            npm install express --save
+
+            cat <<'EOF' >> app.js
+            let express = require('express');
+            let app = express();
+
+            app.get('/api', (req, res) => {
+              console.log(JSON.stringify(req.headers));
+              let message = {
+                timestamp: new Date().toISOString(),
+                headers: req.headers,
+              };
+              res.json(message);
+            });
+
+            app.listen(80, () => {
+              console.log('api is up!');
+            });
+            EOF
+
+            sudo pm2 start ./app.js            
+            sudo pm2 startup systemd
+            sudo pm2 save
+            systemctl enable --now pm2-root.service
+
+            # cfn-init completed so signal success or not
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource instance --region ${AWS::Region}
+
+  s3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true    
+      Tags:
+        - Key: Name
+          Value: CloudFront Workshop
+        - Key: StackName
+          Value: !Sub ${AWS::StackName}
+        - Key: StackId
+          Value: !Sub ${AWS::StackId}
+
+Outputs:
+  ApiURL:
+    Description: URL to API
+    Value: !Sub 'http://${instance.PublicDnsName}/api'
+  S3BucketName:
+    Value: !Ref s3Bucket
+    Description: Name of the S3 origin
+  S3BucketConsole:
+    Description: S3 Bucket Console
+    Value: !Sub 'https://console.aws.amazon.com/s3/buckets/${s3Bucket}?region=${AWS::Region}'
+  EC2instanceDNSname:
+    Description: EC2 instance DNS name 
+    Value: !GetAtt instance.PublicDnsName
+  EC2Console:
+    Description: EC2 Instance Console
+    Value: !Sub "https://console.aws.amazon.com/ec2/home?region=${AWS::Region}#Instances:search=${instance}"
